@@ -7,59 +7,47 @@ package analyzer
 
 import (
 	"encoding/json"
+	"log/slog"
 	"math"
 	"strings"
 
+	"github.com/Mutasem-mk4/bola/internal/config"
 	"github.com/Mutasem-mk4/bola/internal/graph"
 )
 
-// Analyzer compares HTTP responses to determine if a BOLA vulnerability exists.
-type Analyzer struct {
-	similarityThreshold float64
-	errorPatterns       []string
+// ScoredFinding contains the analysis result for a single test pair.
+type ScoredFinding struct {
+	Score         float64
+	Confidence    string
+	KeySimilarity float64
+	ValSimilarity float64
+	SizeDelta     float64
+	ErrorFound    bool
+	Notes         string
 }
 
-// New creates a new response analyzer.
-func New(similarityThreshold float64, errorPatterns []string) *Analyzer {
-	return &Analyzer{
-		similarityThreshold: similarityThreshold,
-		errorPatterns:       errorPatterns,
-	}
-}
-
-// Result contains the analysis output for a single test pair.
-type Result struct {
-	BOLA       bool
-	Confidence graph.Confidence
-	Score      float64
-	SizeDelta  float64
-	Similarity float64
-	Notes      string
-}
-
-// Analyze compares an original response with a test response to detect BOLA.
-func (a *Analyzer) Analyze(pair *graph.TestPair) *Result {
-	original := pair.OriginalRequest
-	test := pair.TestRequest
-
-	result := &Result{}
-
-	// Quick reject: if the test got 401/403/404, authorization is working
+// Analyze compares an original (owner) response with a test (tester) response
+// to determine if a BOLA vulnerability exists.
+// Returns nil if the score is below 30 (not a finding).
+func Analyze(original, test *graph.CapturedRequest, cfg *config.Config) *ScoredFinding {
+	// Quick reject: test got a clear authorization denial
 	if test.StatusCode == 401 || test.StatusCode == 403 || test.StatusCode == 404 {
-		result.Notes = "Authorization properly enforced"
-		return result
+		slog.Debug("analyzer: authorization enforced",
+			"endpoint", original.URL,
+			"test_status", test.StatusCode,
+		)
+		return nil
 	}
 
-	// Quick reject: if original failed too, nothing to compare
+	// Quick reject: original also failed
 	if original.StatusCode >= 400 {
-		result.Notes = "Original request also failed"
-		return result
+		return nil
 	}
 
 	var score float64
 	var notes []string
 
-	// 1. Status code comparison (30 points)
+	// ─── Factor 1: Status Code Match (30 points) ───
 	if test.StatusCode == original.StatusCode {
 		score += 30
 		notes = append(notes, "Same status code")
@@ -68,129 +56,122 @@ func (a *Analyzer) Analyze(pair *graph.TestPair) *Result {
 		notes = append(notes, "Different but successful status")
 	}
 
-	// 2. Response size comparison (20 points)
+	// ─── Factor 2: Response Size Delta (20 points) ───
 	sizeDelta := computeSizeDelta(len(original.ResponseBody), len(test.ResponseBody))
-	result.SizeDelta = sizeDelta
 	if sizeDelta < 0.10 {
 		score += 20
 		notes = append(notes, "Similar response size")
 	} else if sizeDelta < 0.30 {
 		score += 10
-		notes = append(notes, "Moderately different response size")
+		notes = append(notes, "Moderately different size")
 	}
 
-	// 3. JSON structure similarity (25 points)
-	similarity := ComputeJSONSimilarity(original.ResponseBody, test.ResponseBody)
-	result.Similarity = similarity
-	if similarity > a.similarityThreshold {
+	// ─── Factor 3: JSON Key Similarity (25 points) ───
+	keySimilarity := ComputeKeySimilarity(original.ResponseBody, test.ResponseBody)
+	if keySimilarity > cfg.Analysis.SimilarityThreshold {
 		score += 25
 		notes = append(notes, "High structural similarity")
-	} else if similarity > 0.60 {
+	} else if keySimilarity > 0.60 {
 		score += 12
 		notes = append(notes, "Moderate structural similarity")
 	}
 
-	// 4. Value similarity for matching keys (15 points)
-	if similarity > 0.50 {
-		valueSim := ComputeValueSimilarity(original.ResponseBody, test.ResponseBody)
-		if valueSim > 0.50 {
-			score += 15
-			notes = append(notes, "Data values present in test response")
-		} else if valueSim > 0.20 {
-			score += 7
-		}
+	// ─── Factor 4: Value Similarity (15 points) ───
+	valSimilarity := ComputeValueSimilarity(original.ResponseBody, test.ResponseBody)
+	if valSimilarity > 0.50 {
+		score += 15
+		notes = append(notes, "Data values present in test response")
+	} else if valSimilarity > 0.20 {
+		score += 7
 	}
 
-	// 5. Error pattern detection (-30 points / rejection)
-	if a.containsErrorPatterns(test.ResponseBody) {
+	// ─── Factor 5: Error Indicator Detection (10 points / -30 penalty) ───
+	errorFound := DetectErrorIndicators(test.ResponseBody, cfg.Analysis.DetectErrorPatterns)
+	if errorFound {
 		score -= 30
-		notes = append(notes, "Response contains error indicators (200 with error body)")
+		notes = append(notes, "Response contains error indicators (false positive)")
 	} else {
 		score += 10
-		notes = append(notes, "No error indicators in response")
+		notes = append(notes, "No error indicators")
 	}
 
-	// Score to confidence mapping
-	result.Score = score
-	result.Notes = strings.Join(notes, "; ")
+	// ─── Score below threshold → not a finding ───
+	if score < 30 {
+		slog.Debug("analyzer: score below threshold",
+			"endpoint", original.URL,
+			"score", score,
+		)
+		return nil
+	}
 
+	// ─── Map score to confidence ───
+	confidence := "LOW"
 	if score >= 80 {
-		result.BOLA = true
-		result.Confidence = graph.ConfidenceHigh
+		confidence = "HIGH"
 	} else if score >= 50 {
-		result.BOLA = true
-		result.Confidence = graph.ConfidenceMedium
-	} else if score >= 30 {
-		result.BOLA = true
-		result.Confidence = graph.ConfidenceLow
+		confidence = "MEDIUM"
 	}
-	// score < 30 → not a finding (BOLA stays false)
 
-	return result
+	return &ScoredFinding{
+		Score:         score,
+		Confidence:    confidence,
+		KeySimilarity: keySimilarity,
+		ValSimilarity: valSimilarity,
+		SizeDelta:     sizeDelta,
+		ErrorFound:    errorFound,
+		Notes:         strings.Join(notes, "; "),
+	}
 }
 
-// containsErrorPatterns checks if a response body contains error-like patterns.
-func (a *Analyzer) containsErrorPatterns(body []byte) bool {
+// DetectErrorIndicators checks if a response body contains error-like patterns.
+// Uses both JSON structural checks and string matching.
+func DetectErrorIndicators(body []byte, patterns []string) bool {
 	if len(body) == 0 {
 		return false
 	}
 
-	// Try to parse as JSON and check for error fields
+	// Try JSON structural check first
 	var obj map[string]interface{}
 	if err := json.Unmarshal(body, &obj); err == nil {
-		return a.checkJSONForErrors(obj)
-	}
-
-	// Fall back to string matching
-	lower := strings.ToLower(string(body))
-	for _, pattern := range a.errorPatterns {
-		if strings.Contains(lower, pattern) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// checkJSONForErrors checks a JSON object for common error response patterns.
-func (a *Analyzer) checkJSONForErrors(obj map[string]interface{}) bool {
-	// Common error response patterns:
-	// {"error": "..."}, {"message": "...", "status": 401}, {"success": false}
-	errorKeys := []string{"error", "err", "errors"}
-	for _, key := range errorKeys {
-		if v, ok := obj[key]; ok {
-			if v != nil && v != "" && v != false {
+		// {"error": "..."} or {"error": {...}}
+		for _, key := range []string{"error", "err", "errors"} {
+			if v, ok := obj[key]; ok && v != nil && v != "" && v != false {
 				return true
 			}
 		}
-	}
-
-	// Check for {"success": false}
-	if success, ok := obj["success"]; ok {
-		if b, ok := success.(bool); ok && !b {
-			return true
-		}
-	}
-
-	// Check for {"status": "error"} or {"status": "fail"}
-	if status, ok := obj["status"]; ok {
-		if s, ok := status.(string); ok {
-			lower := strings.ToLower(s)
-			if lower == "error" || lower == "fail" || lower == "failure" {
+		// {"success": false}
+		if success, ok := obj["success"]; ok {
+			if b, ok := success.(bool); ok && !b {
 				return true
 			}
 		}
-	}
-
-	// Check message field contains error-like content
-	if msg, ok := obj["message"]; ok {
-		if s, ok := msg.(string); ok {
-			lower := strings.ToLower(s)
-			for _, pattern := range a.errorPatterns {
-				if strings.Contains(lower, pattern) {
+		// {"status": "error"}
+		if status, ok := obj["status"]; ok {
+			if s, ok := status.(string); ok {
+				lower := strings.ToLower(s)
+				if lower == "error" || lower == "fail" || lower == "failure" {
 					return true
 				}
 			}
+		}
+		// Check message field for error patterns
+		if msg, ok := obj["message"]; ok {
+			if s, ok := msg.(string); ok {
+				lower := strings.ToLower(s)
+				for _, p := range patterns {
+					if strings.Contains(lower, p) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: string matching on the entire body
+	lower := strings.ToLower(string(body))
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
 		}
 	}
 
@@ -198,7 +179,6 @@ func (a *Analyzer) checkJSONForErrors(obj map[string]interface{}) bool {
 }
 
 // computeSizeDelta calculates the relative size difference between two responses.
-// Returns a value between 0.0 (identical) and 1.0+ (very different).
 func computeSizeDelta(origSize, testSize int) float64 {
 	if origSize == 0 && testSize == 0 {
 		return 0

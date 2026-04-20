@@ -9,32 +9,39 @@ import (
 	"strings"
 )
 
-// ComputeJSONSimilarity computes the structural similarity between two JSON responses
-// using Jaccard similarity on flattened key sets.
+// ComputeKeySimilarity computes the Jaccard similarity between two JSON responses
+// based on their flattened key sets.
 // Returns a value between 0.0 (completely different) and 1.0 (identical structure).
-func ComputeJSONSimilarity(body1, body2 []byte) float64 {
-	keys1 := flattenJSONKeys(body1)
-	keys2 := flattenJSONKeys(body2)
+func ComputeKeySimilarity(body1, body2 []byte) float64 {
+	keys1 := FlattenJSON(body1)
+	keys2 := FlattenJSON(body2)
 
 	if len(keys1) == 0 && len(keys2) == 0 {
-		// Both empty or non-JSON — compare as plain text
 		return plainTextSimilarity(body1, body2)
 	}
 
-	return jaccardSimilarity(keys1, keys2)
+	set1 := make([]string, 0, len(keys1))
+	for k := range keys1 {
+		set1 = append(set1, k)
+	}
+	set2 := make([]string, 0, len(keys2))
+	for k := range keys2 {
+		set2 = append(set2, k)
+	}
+
+	return jaccardSimilarity(set1, set2)
 }
 
 // ComputeValueSimilarity computes the similarity of values for matching keys
 // between two JSON responses.
 func ComputeValueSimilarity(body1, body2 []byte) float64 {
-	vals1 := flattenJSONValues(body1)
-	vals2 := flattenJSONValues(body2)
+	vals1 := FlattenJSON(body1)
+	vals2 := FlattenJSON(body2)
 
 	if len(vals1) == 0 || len(vals2) == 0 {
 		return 0
 	}
 
-	// Count matching key-value pairs
 	matches := 0
 	total := 0
 	for key, v1 := range vals1 {
@@ -53,78 +60,36 @@ func ComputeValueSimilarity(body1, body2 []byte) float64 {
 	return float64(matches) / float64(total)
 }
 
-// flattenJSONKeys extracts all keys from a JSON document, including nested keys
-// with dot notation (e.g., "user.name", "user.email").
-func flattenJSONKeys(data []byte) []string {
+// FlattenJSON recursively flattens a JSON document into a map of dotted key paths
+// to string values. For example: {"user":{"name":"alice"}} becomes
+// {"user.name": "alice"}.
+func FlattenJSON(data []byte) map[string]string {
 	if len(data) == 0 {
-		return nil
-	}
-
-	var obj map[string]interface{}
-	if err := json.Unmarshal(data, &obj); err != nil {
-		// Try as array
-		var arr []interface{}
-		if err := json.Unmarshal(data, &arr); err != nil {
-			return nil
-		}
-		if len(arr) > 0 {
-			if m, ok := arr[0].(map[string]interface{}); ok {
-				return flattenMap(m, "")
-			}
-		}
-		return nil
-	}
-
-	return flattenMap(obj, "")
-}
-
-// flattenMap recursively extracts keys from a JSON object.
-func flattenMap(obj map[string]interface{}, prefix string) []string {
-	var keys []string
-
-	for key, val := range obj {
-		fullKey := key
-		if prefix != "" {
-			fullKey = prefix + "." + key
-		}
-		keys = append(keys, fullKey)
-
-		switch v := val.(type) {
-		case map[string]interface{}:
-			if strings.Count(fullKey, ".") < 5 {
-				keys = append(keys, flattenMap(v, fullKey)...)
-			}
-		case []interface{}:
-			if len(v) > 0 {
-				if m, ok := v[0].(map[string]interface{}); ok {
-					keys = append(keys, flattenMap(m, fullKey+"[]")...)
-				}
-			}
-		}
-	}
-
-	sort.Strings(keys)
-	return keys
-}
-
-// flattenJSONValues extracts all key-value pairs from a JSON document.
-func flattenJSONValues(data []byte) map[string]string {
-	if len(data) == 0 {
-		return nil
-	}
-
-	var obj map[string]interface{}
-	if err := json.Unmarshal(data, &obj); err != nil {
 		return nil
 	}
 
 	result := make(map[string]string)
-	flattenValuesMap(obj, "", result)
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		flattenMap(obj, "", result)
+		return result
+	}
+
+	var arr []interface{}
+	if err := json.Unmarshal(data, &arr); err == nil {
+		if len(arr) > 0 {
+			if m, ok := arr[0].(map[string]interface{}); ok {
+				flattenMap(m, "", result)
+			}
+		}
+	}
+
 	return result
 }
 
-// flattenValuesMap recursively extracts key-value pairs.
-func flattenValuesMap(obj map[string]interface{}, prefix string, result map[string]string) {
+// flattenMap recursively extracts key-value pairs.
+func flattenMap(obj map[string]interface{}, prefix string, result map[string]string) {
 	for key, val := range obj {
 		fullKey := key
 		if prefix != "" {
@@ -135,14 +100,11 @@ func flattenValuesMap(obj map[string]interface{}, prefix string, result map[stri
 		case string:
 			result[fullKey] = v
 		case float64:
-			result[fullKey] = strings.TrimRight(strings.TrimRight(
-				func() string {
-					if v == float64(int64(v)) {
-						return formatInt(int64(v))
-					}
-					return formatFloat64(v)
-				}(),
-				"0"), ".")
+			if v == float64(int64(v)) {
+				result[fullKey] = intToString(int64(v))
+			} else {
+				result[fullKey] = floatToString(v)
+			}
 		case bool:
 			if v {
 				result[fullKey] = "true"
@@ -153,7 +115,13 @@ func flattenValuesMap(obj map[string]interface{}, prefix string, result map[stri
 			result[fullKey] = "null"
 		case map[string]interface{}:
 			if strings.Count(fullKey, ".") < 5 {
-				flattenValuesMap(v, fullKey, result)
+				flattenMap(v, fullKey, result)
+			}
+		case []interface{}:
+			if len(v) > 0 {
+				if m, ok := v[0].(map[string]interface{}); ok {
+					flattenMap(m, fullKey+"[]", result)
+				}
 			}
 		}
 	}
@@ -192,8 +160,7 @@ func jaccardSimilarity(a, b []string) float64 {
 	return float64(intersection) / float64(union)
 }
 
-// plainTextSimilarity computes a basic similarity between two byte slices
-// based on length comparison.
+// plainTextSimilarity computes a basic length-based similarity.
 func plainTextSimilarity(a, b []byte) float64 {
 	if len(a) == 0 && len(b) == 0 {
 		return 1.0
@@ -201,17 +168,25 @@ func plainTextSimilarity(a, b []byte) float64 {
 	if len(a) == 0 || len(b) == 0 {
 		return 0
 	}
-
 	longer := float64(len(a))
 	shorter := float64(len(b))
 	if shorter > longer {
 		longer, shorter = shorter, longer
 	}
-
 	return shorter / longer
 }
 
-func formatInt(n int64) string {
+// KeysOf returns sorted keys from a flattened JSON map.
+func KeysOf(flat map[string]string) []string {
+	keys := make([]string, 0, len(flat))
+	for k := range flat {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func intToString(n int64) string {
 	if n == 0 {
 		return "0"
 	}
@@ -230,19 +205,17 @@ func formatInt(n int64) string {
 	return string(buf)
 }
 
-func formatFloat64(f float64) string {
-	// Simple float formatting without importing strconv
+func floatToString(f float64) string {
 	intPart := int64(f)
-	fracPart := f - float64(intPart)
-	if fracPart < 0 {
-		fracPart = -fracPart
+	frac := f - float64(intPart)
+	if frac < 0 {
+		frac = -frac
 	}
-	frac := int64(fracPart * 1000000)
-	s := formatInt(intPart) + "."
-	fracStr := formatInt(frac)
-	// Pad to 6 digits
+	fracInt := int64(frac * 1000000)
+	s := intToString(intPart) + "."
+	fracStr := intToString(fracInt)
 	for len(fracStr) < 6 {
 		fracStr = "0" + fracStr
 	}
-	return s + fracStr
+	return strings.TrimRight(strings.TrimRight(s+fracStr, "0"), ".")
 }

@@ -4,12 +4,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
-	"github.com/Mutasem-mk4/bola/internal/analyzer"
 	"github.com/Mutasem-mk4/bola/internal/config"
 	"github.com/Mutasem-mk4/bola/internal/dedup"
 	"github.com/Mutasem-mk4/bola/internal/graph"
@@ -25,14 +27,46 @@ func loadConfig() (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading config %q: %w", cfgFile, err)
 	}
+
+	// Apply CLI flag overrides
+	if proxyListen != "" {
+		cfg.Proxy.Listen = proxyListen
+	}
+	if scanWorkers > 0 {
+		cfg.Testing.Workers = scanWorkers
+	}
+	if scanRate > 0 {
+		cfg.Testing.RateLimit = scanRate
+	}
+	if scanMinConfidence != "" {
+		cfg.Analysis.MinConfidence = strings.ToUpper(scanMinConfidence)
+	}
+	if reportMinConfidence != "" {
+		cfg.Analysis.MinConfidence = strings.ToUpper(reportMinConfidence)
+	}
+
 	return cfg, nil
+}
+
+// setupLogging configures slog based on verbosity flags.
+func setupLogging() {
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+	if quiet {
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})))
 }
 
 // runConfigInit generates an example configuration file.
 func runConfigInit() error {
 	const filename = "bola.yaml"
 	if _, err := os.Stat(filename); err == nil {
-		return fmt.Errorf("%s already exists; remove it first or use a different name", filename)
+		return fmt.Errorf("%s already exists — remove it first or use a different name", filename)
 	}
 	if err := os.WriteFile(filename, []byte(config.ExampleConfig()), 0644); err != nil {
 		return fmt.Errorf("writing config: %w", err)
@@ -43,6 +77,7 @@ func runConfigInit() error {
 
 // runProxy starts the MITM proxy and builds the resource graph.
 func runProxy() error {
+	setupLogging()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -60,8 +95,11 @@ func runProxy() error {
 	}
 
 	// Start token refresher
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	refresher := vault.NewRefresher(v)
-	refresher.Start()
+	refresher.Start(ctx)
 	defer refresher.Stop()
 
 	p, err := proxy.New(cfg, db, v)
@@ -75,11 +113,13 @@ func runProxy() error {
 	go func() {
 		<-sigCh
 		fmt.Println("\n[*] Shutting down proxy...")
+		cancel()
 		p.Stop()
 	}()
 
 	if !quiet {
 		fmt.Printf("[*] Starting MITM proxy on %s\n", cfg.Proxy.Listen)
+		fmt.Printf("[*] CA certificate: %s\n", cfg.Proxy.TLS.CACert)
 		fmt.Println("[*] Configure your browser to use this proxy")
 		fmt.Println("[*] Press Ctrl+C to stop and proceed to scanning")
 	}
@@ -88,7 +128,8 @@ func runProxy() error {
 }
 
 // runImport parses a HAR file and builds the resource graph.
-func runImport(harFile string) error {
+func runImport() error {
+	setupLogging()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -106,19 +147,19 @@ func runImport(harFile string) error {
 	}
 
 	if !quiet {
-		fmt.Printf("[*] Importing HAR file: %s\n", harFile)
+		fmt.Printf("[*] Importing HAR file: %s\n", importHARFile)
 	}
 
-	count, err := proxy.ImportHAR(harFile, cfg, db, v)
+	count, err := proxy.ImportHAR(importHARFile, cfg, db, v)
 	if err != nil {
 		return fmt.Errorf("importing HAR: %w", err)
 	}
 
 	if !quiet {
 		fmt.Printf("[+] Imported %d requests from HAR file\n", count)
-		ec, _ := db.CountEndpoints()
-		rc, _ := db.CountResources()
-		fmt.Printf("[+] Resource graph: %d endpoints, %d resources\n", ec, rc)
+		stats := db.Stats()
+		fmt.Printf("[+] Resource graph: %d endpoints, %d resources\n",
+			stats.Endpoints, stats.Resources)
 	}
 
 	return nil
@@ -126,6 +167,7 @@ func runImport(harFile string) error {
 
 // runScan performs cross-identity authorization testing.
 func runScan() error {
+	setupLogging()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -142,25 +184,34 @@ func runScan() error {
 		return fmt.Errorf("creating vault: %w", err)
 	}
 
-	// Start token refresher during scan
+	// Start token refresher
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	refresher := vault.NewRefresher(v)
-	refresher.Start()
+	refresher.Start(ctx)
 	defer refresher.Stop()
 
-	// Create analyzer
-	az := analyzer.New(cfg.Analysis.SimilarityThreshold, cfg.Analysis.DetectErrorPatterns)
+	// Handle graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\n[*] Scan interrupted, generating report...")
+		cancel()
+	}()
 
-	// Create and run tester
-	t := tester.New(cfg, db, v, az)
+	t := tester.New(cfg, db, v)
 
 	if !quiet {
-		ec, _ := db.CountEndpoints()
-		rc, _ := db.CountResources()
+		stats := db.Stats()
 		fmt.Printf("[*] Scanning %d endpoints with %d resources across %d identities\n",
-			ec, rc, len(cfg.Identities))
+			stats.Endpoints, stats.Resources, len(cfg.Identities))
+		fmt.Printf("[*] Workers: %d, Rate limit: %d/s, Jitter: %v\n",
+			cfg.Testing.Workers, cfg.Testing.RateLimit, cfg.Testing.Jitter)
 	}
 
-	if err := t.Run(); err != nil {
+	if err := t.Run(ctx); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("running scan: %w", err)
 	}
 
@@ -176,6 +227,7 @@ func runScan() error {
 
 // runReport generates reports from existing findings.
 func runReport() error {
+	setupLogging()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -186,6 +238,22 @@ func runReport() error {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer db.Close()
+
+	// Apply format override
+	if reportFormat != "" && reportFormat != "all" {
+		switch reportFormat {
+		case "terminal":
+			cfg.Output.JSON = ""
+			cfg.Output.Markdown = ""
+			cfg.Output.Terminal = true
+		case "json":
+			cfg.Output.Terminal = false
+			cfg.Output.Markdown = ""
+		case "markdown":
+			cfg.Output.Terminal = false
+			cfg.Output.JSON = ""
+		}
+	}
 
 	return generateReports(cfg, db)
 }
@@ -198,14 +266,16 @@ func generateReports(cfg *config.Config, db *graph.DB) error {
 		return fmt.Errorf("listing findings: %w", err)
 	}
 
-	// Terminal output
+	stats := db.Stats()
+
 	if cfg.Output.Terminal {
-		reporter.PrintTerminal(findings)
+		reporter.PrintBanner(version)
+		reporter.PrintSummary(stats)
+		reporter.PrintFindings(findings)
 	}
 
-	// JSON report
 	if cfg.Output.JSON != "" {
-		if err := reporter.WriteJSON(findings, cfg.Output.JSON); err != nil {
+		if err := reporter.ExportJSON(findings, cfg.Output.JSON, version); err != nil {
 			return fmt.Errorf("writing JSON report: %w", err)
 		}
 		if !quiet {
@@ -213,9 +283,8 @@ func generateReports(cfg *config.Config, db *graph.DB) error {
 		}
 	}
 
-	// Markdown report
 	if cfg.Output.Markdown != "" {
-		if err := reporter.WriteMarkdown(findings, cfg.Output.Markdown, cfg.Target.BaseURL); err != nil {
+		if err := reporter.ExportMarkdown(findings, cfg.Output.Markdown, cfg.Target.BaseURL); err != nil {
 			return fmt.Errorf("writing Markdown report: %w", err)
 		}
 		if !quiet {
@@ -224,8 +293,8 @@ func generateReports(cfg *config.Config, db *graph.DB) error {
 	}
 
 	if !quiet {
-		fc, _ := db.CountFindings()
-		fmt.Printf("[+] Total findings: %d\n", fc)
+		fmt.Printf("[+] Total findings: %d (min confidence: %s)\n",
+			len(findings), cfg.Analysis.MinConfidence)
 	}
 
 	return nil

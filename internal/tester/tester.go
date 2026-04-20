@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Mutasem Kharma
 
-// Package tester implements the cross-identity authorization replay engine.
+// Package tester implements the cross-identity authorization replay engine
+// with rate limiting, jitter, progress tracking, and parent-chain verification.
 package tester
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/time/rate"
 
 	"github.com/Mutasem-mk4/bola/internal/analyzer"
 	"github.com/Mutasem-mk4/bola/internal/config"
@@ -25,83 +33,104 @@ type Tester struct {
 	cfg      *config.Config
 	db       *graph.DB
 	vault    *vault.Vault
-	analyzer *analyzer.Analyzer
 	client   *http.Client
-
-	// Rate limiting
-	ticker    *time.Ticker
-	rateLimit chan struct{}
+	limiter  *rate.Limiter
 
 	// Stats
-	mu            sync.Mutex
-	testsRun      int
-	findingsFound int
+	testsRun      atomic.Int64
+	findingsFound atomic.Int64
 }
 
 // New creates a new cross-identity tester.
-func New(cfg *config.Config, db *graph.DB, v *vault.Vault, az *analyzer.Analyzer) *Tester {
+func New(cfg *config.Config, db *graph.DB, v *vault.Vault) *Tester {
 	return &Tester{
-		cfg:      cfg,
-		db:       db,
-		vault:    v,
-		analyzer: az,
+		cfg:   cfg,
+		db:    db,
+		vault: v,
 		client: &http.Client{
 			Timeout: cfg.Testing.Timeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse // Don't follow redirects
 			},
 		},
-		rateLimit: make(chan struct{}, cfg.Testing.RateLimit),
+		limiter: rate.NewLimiter(rate.Limit(cfg.Testing.RateLimit), 1),
 	}
 }
 
 // Run executes the full cross-identity testing suite.
-func (t *Tester) Run() error {
-	// Get all endpoints
+func (t *Tester) Run(ctx context.Context) error {
 	endpoints, err := t.db.ListEndpoints()
 	if err != nil {
-		return fmt.Errorf("listing endpoints: %w", err)
+		return fmt.Errorf("tester: listing endpoints: %w", err)
 	}
 
 	if len(endpoints) == 0 {
-		fmt.Println("[!] No endpoints in resource graph. Run 'bola proxy' or 'bola import' first.")
+		slog.Warn("tester: no endpoints in resource graph — run 'bola proxy' or 'bola import' first")
 		return nil
 	}
 
-	// Start rate limiter
-	t.ticker = time.NewTicker(time.Second / time.Duration(t.cfg.Testing.RateLimit))
-	defer t.ticker.Stop()
+	// Calculate total test pairs for progress bar
+	identityCount := len(t.vault.List())
+	totalPairs := int64(0)
+	for _, ep := range endpoints {
+		resources, _ := t.db.GetResourcesByEndpoint(ep.ID)
+		identityResources := make(map[string]bool)
+		for _, r := range resources {
+			identityResources[r.Identity] = true
+		}
+		totalPairs += int64(len(identityResources)) * int64(identityCount-1)
+	}
+
+	bar := progressbar.NewOptions64(totalPairs,
+		progressbar.OptionSetDescription("Scanning"),
+		progressbar.OptionSetTheme(progressbar.Theme{Saucer: "█", SaucerPadding: "░", BarStart: "[", BarEnd: "]"}),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionSetWidth(40),
+	)
 
 	// Process endpoints with worker pool
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, t.cfg.Testing.Workers)
 
 	for _, ep := range endpoints {
+		if ctx.Err() != nil {
+			break
+		}
+
 		wg.Add(1)
-		sem <- struct{}{} // acquire worker slot
+		sem <- struct{}{}
 
 		go func(ep *graph.Endpoint) {
 			defer wg.Done()
-			defer func() { <-sem }() // release worker slot
+			defer func() { <-sem }()
 
-			if err := t.testEndpoint(ep); err != nil {
-				fmt.Printf("[!] Error testing %s %s: %v\n", ep.Method, ep.Path, err)
+			tested, err := t.testEndpoint(ctx, ep)
+			if err != nil {
+				slog.Error("tester: endpoint test failed",
+					"method", ep.Method,
+					"path", ep.Path,
+					"error", err,
+				)
 			}
+			_ = bar.Add(int(tested))
 		}(ep)
 	}
 
 	wg.Wait()
+	_ = bar.Finish()
 
-	fmt.Printf("[*] Tests completed: %d tests run, %d potential findings\n", t.testsRun, t.findingsFound)
+	fmt.Printf("\n[*] Tests completed: %d tests run, %d potential findings\n",
+		t.testsRun.Load(), t.findingsFound.Load())
+
 	return nil
 }
 
 // testEndpoint tests a single endpoint across all identity pairs.
-func (t *Tester) testEndpoint(ep *graph.Endpoint) error {
-	// Get all resources for this endpoint
+func (t *Tester) testEndpoint(ctx context.Context, ep *graph.Endpoint) (int64, error) {
 	resources, err := t.db.GetResourcesByEndpoint(ep.ID)
 	if err != nil {
-		return fmt.Errorf("getting resources: %w", err)
+		return 0, fmt.Errorf("tester: getting resources: %w", err)
 	}
 
 	// Group resources by identity
@@ -111,113 +140,115 @@ func (t *Tester) testEndpoint(ep *graph.Endpoint) error {
 	}
 
 	identities := t.vault.List()
+	var tested int64
 
-	// For each identity that owns resources, test with every other identity
-	for ownerName, ownerResources := range identityResources {
-		// Get the original request for this endpoint+identity
+	for ownerName := range identityResources {
 		origRequests, err := t.db.GetRequestsByEndpointAndIdentity(ep.ID, ownerName)
 		if err != nil || len(origRequests) == 0 {
+			tested += int64(len(identities) - 1)
 			continue
 		}
 		origReq := origRequests[0]
 
 		for _, testerName := range identities {
+			if ctx.Err() != nil {
+				return tested, ctx.Err()
+			}
+
 			if testerName == ownerName {
 				continue
 			}
+			tested++
 
-			// Don't test admin → admin
+			// Skip admin→admin (same role, same privileges)
 			ownerID, _ := t.vault.Get(ownerName)
 			testerID, _ := t.vault.Get(testerName)
-			if ownerID != nil && testerID != nil && ownerID.Role == testerID.Role && ownerID.Role == "admin" {
+			if ownerID != nil && testerID != nil &&
+				ownerID.Role == testerID.Role && ownerID.Role == "admin" {
 				continue
 			}
 
-			// Check parent chain accessibility first
-			accessible := true
-			for _, r := range ownerResources {
-				if !t.checkParentAccess(r.ID, testerName) {
-					accessible = false
-					break
+			// Check parent chain accessibility
+			for _, r := range identityResources[ownerName] {
+				if !t.checkParentAccess(ctx, r.ID, testerName) {
+					continue
 				}
 			}
-			if !accessible {
-				continue
+
+			// Rate limit + jitter
+			if err := t.limiter.Wait(ctx); err != nil {
+				return tested, err
+			}
+			if t.cfg.Testing.Jitter {
+				jitter := time.Duration(rand.Int63n(100)) * time.Millisecond
+				time.Sleep(jitter)
 			}
 
 			// Replay the request with tester's identity
-			testResult, err := t.replayRequest(origReq, testerName)
+			testResult, err := t.replayRequest(ctx, origReq, testerName)
 			if err != nil {
+				slog.Debug("tester: replay failed",
+					"endpoint", origReq.URL,
+					"tester", testerName,
+					"error", err,
+				)
 				continue
 			}
 
-			t.mu.Lock()
-			t.testsRun++
-			t.mu.Unlock()
+			t.testsRun.Add(1)
 
 			// Analyze the response pair
-			pair := &graph.TestPair{
-				OriginalRequest: origReq,
-				TestRequest:     testResult,
-				OwnerIdentity:   ownerName,
-				TesterIdentity:  testerName,
-				EndpointID:      ep.ID,
+			finding := analyzer.Analyze(origReq, testResult, t.cfg)
+			if finding == nil {
+				continue
 			}
 
-			result := t.analyzer.Analyze(pair)
+			// Check minimum confidence filter
+			if !meetsMinConfidence(finding.Confidence, t.cfg.Analysis.MinConfidence) {
+				continue
+			}
 
-			if result.BOLA {
-				t.mu.Lock()
-				t.findingsFound++
-				t.mu.Unlock()
+			t.findingsFound.Add(1)
 
-				// Build curl command for reproduction
-				curlCmd := buildCurlCommand(origReq, testerName, t.vault)
+			curlCmd := BuildCurlCommand(origReq, testerName, t.vault)
 
-				// Store finding
-				_, err := t.db.InsertFinding(&graph.Finding{
-					EndpointID:      ep.ID,
-					OwnerIdentity:   ownerName,
-					TesterIdentity:  testerName,
-					OwnerStatus:     origReq.StatusCode,
-					TesterStatus:    testResult.StatusCode,
-					SizeDelta:       result.SizeDelta,
-					Similarity:      result.Similarity,
-					ConfidenceLevel: result.Confidence,
-					CurlCommand:     curlCmd,
-					Notes:           result.Notes,
-				})
-				if err != nil {
-					fmt.Printf("[!] Error storing finding: %v\n", err)
-				}
+			_, err = t.db.InsertFinding(&graph.Finding{
+				EndpointID:      ep.ID,
+				OwnerIdentity:   ownerName,
+				TesterIdentity:  testerName,
+				OwnerStatus:     origReq.StatusCode,
+				TesterStatus:    testResult.StatusCode,
+				SizeDelta:       finding.SizeDelta,
+				Similarity:      finding.KeySimilarity,
+				ConfidenceLevel: graph.Confidence(finding.Confidence),
+				CurlCommand:     curlCmd,
+				Notes:           finding.Notes,
+			})
+			if err != nil {
+				slog.Error("tester: storing finding failed", "error", err)
 			}
 		}
 	}
 
-	return nil
+	return tested, nil
 }
 
 // replayRequest replays an original request using a different identity.
-func (t *Tester) replayRequest(orig *graph.CapturedRequest, testerName string) (*graph.CapturedRequest, error) {
-	// Rate limit
-	<-t.ticker.C
-
-	// Build the request
+func (t *Tester) replayRequest(ctx context.Context, orig *graph.CapturedRequest, testerName string) (*graph.CapturedRequest, error) {
 	var body io.Reader
 	if len(orig.Body) > 0 {
 		body = bytes.NewReader(orig.Body)
 	}
 
-	req, err := http.NewRequest(orig.Method, orig.URL, body)
+	req, err := http.NewRequestWithContext(ctx, orig.Method, orig.URL, body)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("tester: creating request: %w", err)
 	}
 
-	// Restore original headers
+	// Restore original headers (except auth)
 	var headers map[string]string
 	if err := json.Unmarshal([]byte(orig.Headers), &headers); err == nil {
 		for k, v := range headers {
-			// Skip auth headers — we'll set the tester's
 			lower := strings.ToLower(k)
 			if lower == "authorization" || lower == "cookie" {
 				continue
@@ -227,8 +258,8 @@ func (t *Tester) replayRequest(orig *graph.CapturedRequest, testerName string) (
 	}
 
 	// Apply tester's authentication
-	if err := t.vault.ApplyAuth(req, testerName); err != nil {
-		return nil, fmt.Errorf("applying auth: %w", err)
+	if err := t.vault.InjectAuth(req, testerName); err != nil {
+		return nil, fmt.Errorf("tester: injecting auth: %w", err)
 	}
 
 	// Execute with retry
@@ -239,17 +270,23 @@ func (t *Tester) replayRequest(orig *graph.CapturedRequest, testerName string) (
 			break
 		}
 		if attempt < t.cfg.Testing.Retry {
-			time.Sleep(time.Second * time.Duration(attempt+1))
+			backoff := time.Second * time.Duration(attempt+1)
+			slog.Debug("tester: retrying request",
+				"attempt", attempt+1,
+				"backoff", backoff,
+				"error", err,
+			)
+			time.Sleep(backoff)
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
+		return nil, fmt.Errorf("tester: executing request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, fmt.Errorf("tester: reading response: %w", err)
 	}
 
 	respHeaders, _ := json.Marshal(headerMap(resp.Header))
@@ -267,10 +304,10 @@ func (t *Tester) replayRequest(orig *graph.CapturedRequest, testerName string) (
 }
 
 // checkParentAccess verifies that a tester can access parent resources.
-func (t *Tester) checkParentAccess(resourceID int64, testerName string) bool {
+func (t *Tester) checkParentAccess(ctx context.Context, resourceID int64, testerName string) bool {
 	parents, err := t.db.GetParentChain(resourceID)
 	if err != nil || len(parents) == 0 {
-		return true // No parents = no chain to check
+		return true // No parents = no chain to verify
 	}
 
 	for _, parent := range parents {
@@ -279,24 +316,27 @@ func (t *Tester) checkParentAccess(resourceID int64, testerName string) bool {
 			continue
 		}
 
-		testResult, err := t.replayRequest(requests[0], testerName)
+		testResult, err := t.replayRequest(ctx, requests[0], testerName)
 		if err != nil {
 			return false
 		}
 
 		if testResult.StatusCode == 401 || testResult.StatusCode == 403 {
-			return false // Tester can't access parent
+			slog.Debug("tester: parent access denied, skipping child",
+				"parent_endpoint", requests[0].URL,
+				"tester", testerName,
+			)
+			return false
 		}
 	}
 
 	return true
 }
 
-// buildCurlCommand generates a curl command to reproduce a finding.
-func buildCurlCommand(orig *graph.CapturedRequest, testerName string, v *vault.Vault) string {
+// BuildCurlCommand generates a curl command to reproduce a finding.
+func BuildCurlCommand(orig *graph.CapturedRequest, testerName string, v *vault.Vault) string {
 	parts := []string{"curl", "-X", orig.Method}
 
-	// Add tester's auth headers
 	testerID, err := v.Get(testerName)
 	if err == nil {
 		for k, val := range testerID.Headers {
@@ -307,10 +347,8 @@ func buildCurlCommand(orig *graph.CapturedRequest, testerName string, v *vault.V
 		}
 	}
 
-	// Add content type
 	parts = append(parts, "-H", "'Content-Type: application/json'")
 
-	// Add body if present
 	if len(orig.Body) > 0 {
 		parts = append(parts, "-d", fmt.Sprintf("'%s'", string(orig.Body)))
 	}
@@ -318,6 +356,12 @@ func buildCurlCommand(orig *graph.CapturedRequest, testerName string, v *vault.V
 	parts = append(parts, fmt.Sprintf("'%s'", orig.URL))
 
 	return strings.Join(parts, " \\\n  ")
+}
+
+// meetsMinConfidence checks if a finding meets the minimum confidence threshold.
+func meetsMinConfidence(finding, minimum string) bool {
+	rank := map[string]int{"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+	return rank[finding] >= rank[minimum]
 }
 
 // headerMap converts http.Header to map[string]string.
@@ -329,4 +373,9 @@ func headerMap(h http.Header) map[string]string {
 		}
 	}
 	return m
+}
+
+// Stats returns the current test statistics.
+func (t *Tester) Stats() (testsRun, findingsFound int64) {
+	return t.testsRun.Load(), t.findingsFound.Load()
 }

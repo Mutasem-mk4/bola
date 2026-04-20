@@ -5,25 +5,49 @@ package proxy
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 )
 
-// ExtractedID represents an object identifier extracted from an HTTP exchange.
-type ExtractedID struct {
-	Value    string // the actual ID value (e.g., "123", "abc-def-ghi-jkl")
-	Type     string // uuid | integer | mongoid | hash
+// IDType represents the classification of an extracted object identifier.
+type IDType string
+
+const (
+	IDTypeUUID    IDType = "uuid"
+	IDTypeInteger IDType = "integer"
+	IDTypeMongoID IDType = "mongoid"
+	IDTypeHash    IDType = "hash"
+)
+
+// ObjectID represents an object identifier extracted from an HTTP exchange.
+type ObjectID struct {
+	Value    string // the actual ID value
+	Type     IDType // uuid | integer | mongoid | hash
 	Location string // path | query | body | header
 	Key      string // the parameter or JSON key name
 }
 
-// Regex patterns for identifying different ID types.
+// Package-level compiled regex patterns for performance.
 var (
-	uuidPattern    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	// Strict UUIDv4: 8-4-4-4-12 hex with version 4 indicator and variant bits
+	uuidV4Pattern = regexp.MustCompile(
+		`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`,
+	)
+	// Generic UUID: any version
+	uuidGenericPattern = regexp.MustCompile(
+		`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
+	)
+	// MongoDB ObjectID: exactly 24 hex chars
 	mongoIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
-	integerPattern = regexp.MustCompile(`^\d+$`)
+	// Integer ID: digits only, reasonable range (1 to 2^53)
+	integerIDPattern = regexp.MustCompile(`^\d+$`)
+	// UUID scanner for finding UUIDs within strings
+	uuidScanPattern = regexp.MustCompile(
+		`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`,
+	)
 
 	// JSON keys that commonly contain object IDs
 	idKeyPatterns = []*regexp.Regexp{
@@ -36,36 +60,33 @@ var (
 		regexp.MustCompile(`(?i)^key$`),
 		regexp.MustCompile(`(?i)^slug$`),
 		regexp.MustCompile(`(?i)^ref$`),
-		regexp.MustCompile(`(?i)^token$`),
-		regexp.MustCompile(`(?i)^code$`),
+		regexp.MustCompile(`(?i)^resource_id$`),
+		regexp.MustCompile(`(?i)^object_id$`),
 	}
-
-	// UUID pattern for scanning within strings
-	uuidScanPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
 )
 
+const maxIntegerID = 1 << 53 // JavaScript safe integer limit
+
 // ExtractAll extracts all object IDs from a URL, response body, and headers.
-func ExtractAll(reqURL *url.URL, body []byte, respHeaders http.Header) []ExtractedID {
-	var results []ExtractedID
-
-	// 1. Extract from URL path segments
-	results = append(results, ExtractFromPath(reqURL.Path)...)
-
-	// 2. Extract from query parameters
-	results = append(results, ExtractFromQuery(reqURL.Query())...)
-
-	// 3. Extract from response body (JSON)
-	results = append(results, ExtractFromJSONBody(body)...)
-
-	// 4. Extract from response headers
+func ExtractAll(reqURL *url.URL, body []byte, respHeaders http.Header) []ObjectID {
+	var results []ObjectID
+	results = append(results, ExtractFromURL(reqURL)...)
+	results = append(results, ExtractFromBody(body, respHeaders.Get("Content-Type"))...)
 	results = append(results, ExtractFromHeaders(respHeaders)...)
-
 	return dedupExtracted(results)
 }
 
-// ExtractFromPath extracts object IDs from URL path segments.
-func ExtractFromPath(path string) []ExtractedID {
-	var results []ExtractedID
+// ExtractFromURL extracts object IDs from URL path segments and query parameters.
+func ExtractFromURL(u *url.URL) []ObjectID {
+	var results []ObjectID
+	results = append(results, extractFromPath(u.Path)...)
+	results = append(results, extractFromQuery(u.Query())...)
+	return results
+}
+
+// extractFromPath extracts object IDs from URL path segments.
+func extractFromPath(path string) []ObjectID {
+	var results []ObjectID
 	segments := strings.Split(strings.Trim(path, "/"), "/")
 
 	for i, seg := range segments {
@@ -78,13 +99,13 @@ func ExtractFromPath(path string) []ExtractedID {
 			continue
 		}
 
-		// Try to infer the key from the previous path segment
+		// Infer key from previous path segment (resource name)
 		key := ""
 		if i > 0 {
 			key = segments[i-1]
 		}
 
-		results = append(results, ExtractedID{
+		results = append(results, ObjectID{
 			Value:    seg,
 			Type:     idType,
 			Location: "path",
@@ -95,20 +116,28 @@ func ExtractFromPath(path string) []ExtractedID {
 	return results
 }
 
-// ExtractFromQuery extracts object IDs from URL query parameters.
-func ExtractFromQuery(params url.Values) []ExtractedID {
-	var results []ExtractedID
+// extractFromQuery extracts object IDs from URL query parameters.
+func extractFromQuery(params url.Values) []ObjectID {
+	var results []ObjectID
 
 	for key, values := range params {
 		for _, val := range values {
 			if val == "" {
 				continue
 			}
+			// Prioritize keys that look like ID params
 			idType := ClassifyID(val)
+			if idType == "" && isIDKey(key) {
+				// Even if the value doesn't match standard patterns,
+				// if the key strongly suggests an ID, classify as hash
+				if len(val) >= 8 {
+					idType = IDTypeHash
+				}
+			}
 			if idType == "" {
 				continue
 			}
-			results = append(results, ExtractedID{
+			results = append(results, ObjectID{
 				Value:    val,
 				Type:     idType,
 				Location: "query",
@@ -120,13 +149,18 @@ func ExtractFromQuery(params url.Values) []ExtractedID {
 	return results
 }
 
-// ExtractFromJSONBody recursively extracts object IDs from a JSON response body.
-func ExtractFromJSONBody(body []byte) []ExtractedID {
+// ExtractFromBody extracts object IDs from a response body.
+func ExtractFromBody(body []byte, contentType string) []ObjectID {
 	if len(body) == 0 {
 		return nil
 	}
 
-	var results []ExtractedID
+	// Only parse JSON bodies
+	if !strings.Contains(contentType, "json") && !isJSON(body) {
+		return nil
+	}
+
+	var results []ObjectID
 
 	// Try parsing as JSON object
 	var obj map[string]interface{}
@@ -138,8 +172,12 @@ func ExtractFromJSONBody(body []byte) []ExtractedID {
 	// Try parsing as JSON array
 	var arr []interface{}
 	if err := json.Unmarshal(body, &arr); err == nil {
-		for _, item := range arr {
-			if m, ok := item.(map[string]interface{}); ok {
+		limit := 5 // Only inspect first 5 items to avoid performance issues
+		if len(arr) < limit {
+			limit = len(arr)
+		}
+		for i := 0; i < limit; i++ {
+			if m, ok := arr[i].(map[string]interface{}); ok {
 				results = append(results, extractFromMap(m, "")...)
 			}
 		}
@@ -149,8 +187,8 @@ func ExtractFromJSONBody(body []byte) []ExtractedID {
 }
 
 // extractFromMap recursively traverses a JSON object to find ID-like values.
-func extractFromMap(obj map[string]interface{}, prefix string) []ExtractedID {
-	var results []ExtractedID
+func extractFromMap(obj map[string]interface{}, prefix string) []ObjectID {
+	var results []ObjectID
 
 	for key, val := range obj {
 		fullKey := key
@@ -160,42 +198,41 @@ func extractFromMap(obj map[string]interface{}, prefix string) []ExtractedID {
 
 		switch v := val.(type) {
 		case string:
-			if isIDKey(key) || ClassifyID(v) != "" {
-				idType := ClassifyID(v)
-				if idType == "" {
-					idType = "hash" // ID key but unrecognized format
+			idType := ClassifyID(v)
+			if idType != "" || isIDKey(key) {
+				if idType == "" && len(v) >= 4 {
+					idType = IDTypeHash
 				}
-				results = append(results, ExtractedID{
-					Value:    v,
-					Type:     idType,
-					Location: "body",
-					Key:      fullKey,
-				})
+				if idType != "" {
+					results = append(results, ObjectID{
+						Value:    v,
+						Type:     idType,
+						Location: "body",
+						Key:      fullKey,
+					})
+				}
 			}
 		case float64:
-			// JSON numbers that look like IDs (associated with ID-like keys)
-			if isIDKey(key) {
-				results = append(results, ExtractedID{
-					Value:    formatFloat(v),
-					Type:     "integer",
+			if isIDKey(key) && v > 0 && v < maxIntegerID && v == math.Floor(v) {
+				results = append(results, ObjectID{
+					Value:    formatInt(int64(v)),
+					Type:     IDTypeInteger,
 					Location: "body",
 					Key:      fullKey,
 				})
 			}
 		case map[string]interface{}:
-			// Recurse into nested objects (limit depth to avoid infinite loops)
 			if strings.Count(fullKey, ".") < 5 {
 				results = append(results, extractFromMap(v, fullKey)...)
 			}
 		case []interface{}:
-			// Check first few items in arrays
 			limit := 3
 			if len(v) < limit {
 				limit = len(v)
 			}
 			for i := 0; i < limit; i++ {
 				if m, ok := v[i].(map[string]interface{}); ok {
-					results = append(results, extractFromMap(m, fullKey)...)
+					results = append(results, extractFromMap(m, fullKey+"[]")...)
 				}
 			}
 		}
@@ -204,9 +241,9 @@ func extractFromMap(obj map[string]interface{}, prefix string) []ExtractedID {
 	return results
 }
 
-// ExtractFromHeaders extracts object IDs from response headers.
-func ExtractFromHeaders(headers http.Header) []ExtractedID {
-	var results []ExtractedID
+// ExtractFromHeaders extracts object IDs from HTTP response headers.
+func ExtractFromHeaders(headers http.Header) []ObjectID {
+	var results []ObjectID
 
 	interestingHeaders := []string{"Location", "X-Request-Id", "X-Resource-Id", "ETag"}
 	for _, h := range interestingHeaders {
@@ -215,12 +252,12 @@ func ExtractFromHeaders(headers http.Header) []ExtractedID {
 			continue
 		}
 
-		// Check for UUIDs in header values
+		// Scan for UUIDs in header values
 		if matches := uuidScanPattern.FindAllString(val, -1); len(matches) > 0 {
 			for _, m := range matches {
-				results = append(results, ExtractedID{
+				results = append(results, ObjectID{
 					Value:    m,
-					Type:     "uuid",
+					Type:     IDTypeUUID,
 					Location: "header",
 					Key:      h,
 				})
@@ -233,29 +270,26 @@ func ExtractFromHeaders(headers http.Header) []ExtractedID {
 
 // ClassifyID determines the type of an identifier string.
 // Returns empty string if the value doesn't look like an ID.
-func ClassifyID(val string) string {
+func ClassifyID(val string) IDType {
 	if val == "" {
 		return ""
 	}
 
-	if uuidPattern.MatchString(val) {
-		return "uuid"
+	if uuidGenericPattern.MatchString(val) {
+		return IDTypeUUID
 	}
 
 	if mongoIDPattern.MatchString(val) {
-		return "mongoid"
+		return IDTypeMongoID
 	}
 
-	if integerPattern.MatchString(val) {
-		// Ignore very small numbers (likely not IDs) and very large numbers
-		if len(val) >= 1 && len(val) <= 20 {
-			return "integer"
-		}
+	if integerIDPattern.MatchString(val) && len(val) <= 16 && len(val) >= 1 {
+		return IDTypeInteger
 	}
 
 	// Long alphanumeric strings might be hashes/tokens
 	if len(val) >= 16 && isAlphanumeric(val) {
-		return "hash"
+		return IDTypeHash
 	}
 
 	return ""
@@ -269,13 +303,13 @@ func NormalizePath(path string) string {
 			continue
 		}
 		switch ClassifyID(seg) {
-		case "uuid":
+		case IDTypeUUID:
 			segments[i] = "{uuid}"
-		case "integer":
+		case IDTypeInteger:
 			segments[i] = "{id}"
-		case "mongoid":
+		case IDTypeMongoID:
 			segments[i] = "{mongoid}"
-		case "hash":
+		case IDTypeHash:
 			segments[i] = "{hash}"
 		}
 	}
@@ -302,57 +336,41 @@ func isAlphanumeric(s string) bool {
 	return true
 }
 
-// formatFloat formats a float64 as an integer string if it has no decimal part.
-func formatFloat(f float64) string {
-	if f == float64(int64(f)) {
-		return strings.TrimRight(strings.TrimRight(
-			strings.Replace(
-				strings.Replace(
-					strings.Replace(
-						formatFloatBasic(f), ".000000", "", 1),
-					".00000", "", 1),
-				".0000", "", 1),
-			"0"), ".")
+// isJSON checks if a byte slice starts with a JSON-like character.
+func isJSON(data []byte) bool {
+	for _, b := range data {
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			continue
+		}
+		return b == '{' || b == '['
 	}
-	return formatFloatBasic(f)
+	return false
 }
 
-func formatFloatBasic(f float64) string {
-	return strings.TrimRight(strings.TrimRight(
-		func() string {
-			s := make([]byte, 0, 32)
-			s = append(s, []byte(func() string {
-				if f < 0 {
-					return "-"
-				}
-				return ""
-			}())...)
-
-			abs := f
-			if abs < 0 {
-				abs = -abs
-			}
-
-			intPart := int64(abs)
-			buf := make([]byte, 0, 20)
-			if intPart == 0 {
-				buf = append(buf, '0')
-			} else {
-				for intPart > 0 {
-					buf = append([]byte{byte('0' + intPart%10)}, buf...)
-					intPart /= 10
-				}
-			}
-			s = append(s, buf...)
-			return string(s)
-		}(),
-		"0"), ".")
+// formatInt converts an int64 to string without importing strconv.
+func formatInt(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	buf := make([]byte, 0, 20)
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	if neg {
+		buf = append([]byte{'-'}, buf...)
+	}
+	return string(buf)
 }
 
 // dedupExtracted removes duplicate extracted IDs.
-func dedupExtracted(ids []ExtractedID) []ExtractedID {
+func dedupExtracted(ids []ObjectID) []ObjectID {
 	seen := make(map[string]bool)
-	var result []ExtractedID
+	var result []ObjectID
 	for _, id := range ids {
 		key := id.Location + ":" + id.Key + ":" + id.Value
 		if !seen[key] {

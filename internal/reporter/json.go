@@ -47,13 +47,13 @@ type JSONSummary struct {
 	Low    int `json:"low"`
 }
 
-// WriteJSON generates a JSON report file from findings.
-func WriteJSON(findings []*graph.Finding, path string) error {
+// ExportJSON generates a JSON report file from findings.
+func ExportJSON(findings []*graph.Finding, path string, version string) error {
 	high, medium, low := countByConfidence(findings)
 
 	report := JSONReport{
 		Tool:      "bola",
-		Version:   "0.1.0",
+		Version:   version,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Summary: JSONSummary{
 			Total:  high + medium + low,
@@ -64,9 +64,7 @@ func WriteJSON(findings []*graph.Finding, path string) error {
 	}
 
 	for _, f := range findings {
-		method := ""
-		fpath := ""
-		rawPath := ""
+		method, fpath, rawPath := "", "", ""
 		if f.Endpoint != nil {
 			method = f.Endpoint.Method
 			fpath = f.Endpoint.Path
@@ -93,12 +91,8 @@ func WriteJSON(findings []*graph.Finding, path string) error {
 
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling JSON report: %w", err)
+		return fmt.Errorf("reporter: marshaling JSON: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("writing JSON report: %w", err)
-	}
-
-	return nil
+	return os.WriteFile(path, data, 0644)
 }

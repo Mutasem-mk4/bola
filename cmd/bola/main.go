@@ -14,8 +14,8 @@ import (
 
 // Version and build information, set by ldflags during build.
 var (
-	Version        = "dev"
-	BuildGoVersion = "unknown"
+	version        = "dev"
+	buildGoVersion = "unknown"
 )
 
 func main() {
@@ -26,9 +26,9 @@ func main() {
 }
 
 var (
-	cfgFile string
-	verbose bool
-	quiet   bool
+	cfgFile       string
+	verbose       bool
+	quiet         bool
 )
 
 var rootCmd = &cobra.Command{
@@ -42,11 +42,14 @@ ownership. It dynamically builds a resource graph from live proxy traffic or
 HAR imports, then systematically tests cross-identity access to every
 discovered resource.
 
-Usage:
+Workflow:
   1. Configure identities:  bola config init
   2. Capture traffic:       bola proxy --config bola.yaml
   3. Run tests:             bola scan --config bola.yaml
-  4. Generate reports:      bola report --config bola.yaml`,
+  4. Generate reports:      bola report --config bola.yaml
+
+Developed by Mutasem — Cybersecurity & Software Engineer
+https://github.com/Mutasem-mk4`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
@@ -55,8 +58,13 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print bola version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("bola %s (built with %s)\n", Version, BuildGoVersion)
+		fmt.Printf("bola %s (built with %s)\n", version, buildGoVersion)
 	},
+}
+
+var configCmd = &cobra.Command{
+	Use:   "config",
+	Short: "Configuration management",
 }
 
 var configInitCmd = &cobra.Command{
@@ -67,56 +75,59 @@ var configInitCmd = &cobra.Command{
 	},
 }
 
-var configCmd = &cobra.Command{
-	Use:   "config",
-	Short: "Configuration management",
-}
+// Proxy flags
+var proxyListen string
+var proxyIdentity string
 
 var proxyCmd = &cobra.Command{
 	Use:   "proxy",
 	Short: "Start the MITM proxy and build the resource graph",
 	Long: `Start an HTTP/HTTPS proxy that transparently intercepts traffic.
-While you browse the target application, bola silently maps every endpoint,
+While browsing the target application, bola silently maps every endpoint,
 extracts object IDs from responses, and builds an ownership resource graph.
 
-Configure your browser or API client to use the proxy at the address
-specified in your bola.yaml configuration (default: 127.0.0.1:8080).`,
+The MITM CA certificate is auto-generated on first run to ~/.bola/ca.pem.
+Install it in your browser to inspect HTTPS traffic.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runProxy()
 	},
 }
 
+var importHARFile string
+
 var importCmd = &cobra.Command{
-	Use:   "import [har-file]",
+	Use:   "import",
 	Short: "Import a HAR file to build the resource graph",
 	Long: `Parse a Burp Suite or ZAP Proxy HAR export to build the resource
-graph without live proxy interception. This is useful when you've already
-captured traffic in another tool.`,
-	Args: cobra.ExactArgs(1),
+graph without live proxy interception.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runImport(args[0])
+		return runImport()
 	},
 }
+
+// Scan flags
+var scanWorkers int
+var scanRate int
+var scanMinConfidence string
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
 	Short: "Run cross-identity authorization tests",
-	Long: `For every resource discovered in the resource graph, replay the
-request using each other identity. Compare responses to detect BOLA/IDOR
-vulnerabilities with confidence scoring.
-
-The resource graph must be built first using 'bola proxy' or 'bola import'.`,
+	Long: `For every resource in the resource graph, replay the request using
+each other identity. Compare responses to detect BOLA/IDOR vulnerabilities
+with confidence scoring.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runScan()
 	},
 }
 
+// Report flags
+var reportFormat string
+var reportMinConfidence string
+
 var reportCmd = &cobra.Command{
 	Use:   "report",
 	Short: "Generate reports from existing scan results",
-	Long: `Generate terminal, JSON, and/or Markdown reports from the findings
-stored in the bola database. Useful for re-generating reports with different
-formats or after manual review.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runReport()
 	},
@@ -126,6 +137,19 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "bola.yaml", "config file path")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress non-essential output")
+
+	proxyCmd.Flags().StringVar(&proxyListen, "listen", "", "override proxy listen address")
+	proxyCmd.Flags().StringVar(&proxyIdentity, "identity", "", "filter to specific identity")
+
+	importCmd.Flags().StringVar(&importHARFile, "har", "", "HAR file to import")
+	_ = importCmd.MarkFlagRequired("har")
+
+	scanCmd.Flags().IntVar(&scanWorkers, "workers", 0, "override worker count")
+	scanCmd.Flags().IntVar(&scanRate, "rate", 0, "override rate limit")
+	scanCmd.Flags().StringVar(&scanMinConfidence, "min-confidence", "", "minimum confidence (HIGH/MEDIUM/LOW)")
+
+	reportCmd.Flags().StringVar(&reportFormat, "format", "all", "output format (terminal|json|markdown|all)")
+	reportCmd.Flags().StringVar(&reportMinConfidence, "min-confidence", "", "minimum confidence filter")
 
 	configCmd.AddCommand(configInitCmd)
 	rootCmd.AddCommand(versionCmd)

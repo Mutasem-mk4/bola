@@ -1,59 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Mutasem Kharma
 
-// Package graph provides the SQLite-backed resource graph for bola.
-// It stores endpoints, resources (object IDs), their ownership relationships,
-// captured requests/responses, and BOLA findings.
 package graph
 
 import "time"
 
-// Endpoint represents a unique API endpoint (method + normalized path).
-type Endpoint struct {
-	ID          int64     `json:"id"`
-	Method      string    `json:"method"`
-	Path        string    `json:"path"`       // normalized: /api/users/{id}
-	RawPath     string    `json:"raw_path"`   // original: /api/users/123
-	ContentType string    `json:"content_type"`
-	CreatedAt   time.Time `json:"created_at"`
-}
-
-// Resource represents an object ID extracted from an API response.
-type Resource struct {
-	ID         int64     `json:"id"`
-	EndpointID int64     `json:"endpoint_id"`
-	Identity   string    `json:"identity"`    // which identity owns this
-	ObjectID   string    `json:"object_id"`   // the actual ID value
-	IDType     string    `json:"id_type"`     // uuid | integer | mongoid | hash
-	IDLocation string    `json:"id_location"` // path | query | body | header
-	IDKey      string    `json:"id_key"`      // the JSON key or param name
-	CreatedAt  time.Time `json:"created_at"`
-}
-
-// Relationship represents a parent-child link between resources.
-type Relationship struct {
-	ParentID int64 `json:"parent_id"`
-	ChildID  int64 `json:"child_id"`
-	Depth    int   `json:"depth"`
-}
-
-// CapturedRequest stores a full HTTP request/response pair.
-type CapturedRequest struct {
-	ID              int64     `json:"id"`
-	EndpointID      int64     `json:"endpoint_id"`
-	Identity        string    `json:"identity"`
-	Method          string    `json:"method"`
-	URL             string    `json:"url"`
-	Headers         string    `json:"headers"`          // JSON serialized
-	Body            []byte    `json:"body,omitempty"`
-	StatusCode      int       `json:"status_code"`
-	ResponseHeaders string    `json:"response_headers"` // JSON serialized
-	ResponseBody    []byte    `json:"response_body,omitempty"`
-	ResponseSize    int       `json:"response_size"`
-	CreatedAt       time.Time `json:"created_at"`
-}
-
-// Confidence represents the confidence level of a BOLA finding.
+// Confidence represents the confidence level of a finding.
 type Confidence string
 
 const (
@@ -62,30 +14,72 @@ const (
 	ConfidenceLow    Confidence = "LOW"
 )
 
-// Finding represents a potential BOLA/IDOR vulnerability.
-type Finding struct {
-	ID              int64      `json:"id"`
-	EndpointID      int64      `json:"endpoint_id"`
-	OwnerIdentity   string     `json:"owner_identity"`
-	TesterIdentity  string     `json:"tester_identity"`
-	OwnerStatus     int        `json:"owner_status"`
-	TesterStatus    int        `json:"tester_status"`
-	SizeDelta       float64    `json:"size_delta"`
-	Similarity      float64    `json:"similarity"`
-	ConfidenceLevel Confidence `json:"confidence"`
-	CurlCommand     string     `json:"curl_command"`
-	Notes           string     `json:"notes"`
-	CreatedAt       time.Time  `json:"created_at"`
-
-	// Populated by joins, not stored directly
-	Endpoint *Endpoint `json:"endpoint,omitempty"`
+// Endpoint represents a normalized API endpoint.
+type Endpoint struct {
+	ID      int64
+	Method  string
+	Path    string // Normalized path pattern (e.g., /api/users/{id})
+	RawPath string // Original raw path
 }
 
-// TestPair holds the original and test response for comparison.
-type TestPair struct {
-	OriginalRequest  *CapturedRequest
-	TestRequest      *CapturedRequest
-	OwnerIdentity    string
-	TesterIdentity   string
-	EndpointID       int64
+// Resource represents an extracted object identifier owned by an identity.
+type Resource struct {
+	ID         int64
+	EndpointID int64
+	Identity   string // identity name from vault
+	ObjectID   string // the actual ID value
+	IDType     string // uuid, integer, mongoid, hash
+	Location   string // path, query, body, header
+	Key        string // the parameter or JSON key
+}
+
+// Relationship represents a parent-child link between resources.
+type Relationship struct {
+	ID       int64
+	ParentID int64
+	ChildID  int64
+}
+
+// CapturedRequest represents a full HTTP request/response pair.
+type CapturedRequest struct {
+	ID              int64
+	EndpointID      int64
+	Identity        string
+	Method          string
+	URL             string
+	Headers         string // JSON-encoded map[string]string
+	Body            []byte
+	StatusCode      int
+	ResponseHeaders string // JSON-encoded
+	ResponseBody    []byte
+	ResponseSize    int
+	CreatedAt       time.Time
+}
+
+// Finding represents a confirmed or suspected BOLA/IDOR vulnerability.
+type Finding struct {
+	ID              int64
+	EndpointID      int64
+	OwnerIdentity   string
+	TesterIdentity  string
+	OwnerStatus     int
+	TesterStatus    int
+	SizeDelta       float64
+	Similarity      float64
+	ConfidenceLevel Confidence
+	CurlCommand     string
+	Notes           string
+	Deduplicated    bool
+	CreatedAt       time.Time
+
+	// Joined fields (populated by queries)
+	Endpoint *Endpoint
+}
+
+// Stats holds aggregate counts for the resource graph.
+type Stats struct {
+	Endpoints int
+	Resources int
+	Requests  int
+	Findings  int
 }

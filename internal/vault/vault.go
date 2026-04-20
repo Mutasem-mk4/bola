@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Mutasem Kharma
 
-// Package vault provides identity and token management for bola.
-// It handles multiple user sessions, auto-detects token formats,
-// and manages token lifecycle including refresh.
+// Package vault provides multi-identity session management for bola.
+// It handles JWT/Cookie/Bearer/Basic authentication with auto-detection,
+// expiry monitoring, and token refresh lifecycle.
 package vault
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -26,6 +25,7 @@ const (
 	TokenTypeBearer  TokenType = "Bearer"
 	TokenTypeCookie  TokenType = "Cookie"
 	TokenTypeBasic   TokenType = "Basic"
+	TokenTypeAPIKey  TokenType = "APIKey"
 	TokenTypeUnknown TokenType = "Unknown"
 )
 
@@ -39,6 +39,7 @@ type Identity struct {
 	RefreshToken string
 	RefreshURL   string
 	ExpiresAt    time.Time
+	Subject      string // JWT sub claim
 
 	mu sync.RWMutex
 }
@@ -59,9 +60,14 @@ func New(identities []config.IdentityConfig) (*Vault, error) {
 		id := &Identity{
 			Name:         ic.Name,
 			Role:         ic.Role,
-			Headers:      ic.Headers,
+			Headers:      make(map[string]string),
 			RefreshToken: ic.RefreshToken,
 			RefreshURL:   ic.RefreshURL,
+		}
+
+		// Copy headers
+		for k, val := range ic.Headers {
+			id.Headers[k] = val
 		}
 
 		// Convert config cookies to http.Cookie
@@ -74,17 +80,36 @@ func New(identities []config.IdentityConfig) (*Vault, error) {
 			})
 		}
 
-		// Auto-detect token type
+		// Auto-detect token type and parse JWT claims
 		id.TokenType = DetectTokenType(id.Headers, id.Cookies)
 
-		// If JWT, extract expiry
 		if id.TokenType == TokenTypeJWT {
 			if auth, ok := id.Headers["Authorization"]; ok {
 				token := strings.TrimPrefix(auth, "Bearer ")
-				if exp, err := ExtractJWTExpiry(token); err == nil {
-					id.ExpiresAt = exp
+				claims, err := ParseJWTClaims(token)
+				if err == nil {
+					id.ExpiresAt = claims.ExpiresAt
+					id.Subject = claims.Subject
+					slog.Debug("vault: parsed JWT",
+						"identity", id.Name,
+						"sub", claims.Subject,
+						"exp", claims.ExpiresAt.Format(time.RFC3339),
+					)
+				} else {
+					slog.Warn("vault: failed to parse JWT claims",
+						"identity", id.Name,
+						"error", err,
+					)
 				}
 			}
+		}
+
+		// Warn if token is expired
+		if !id.ExpiresAt.IsZero() && time.Now().After(id.ExpiresAt) {
+			slog.Warn("vault: token is EXPIRED",
+				"identity", id.Name,
+				"expired_at", id.ExpiresAt.Format(time.RFC3339),
+			)
 		}
 
 		v.identities[ic.Name] = id
@@ -100,9 +125,35 @@ func (v *Vault) Get(name string) (*Identity, error) {
 
 	id, ok := v.identities[name]
 	if !ok {
-		return nil, fmt.Errorf("identity %q not found", name)
+		return nil, fmt.Errorf("vault: identity %q not found", name)
 	}
 	return id, nil
+}
+
+// GetAll returns all identities.
+func (v *Vault) GetAll() []*Identity {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	ids := make([]*Identity, 0, len(v.identities))
+	for _, id := range v.identities {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// GetByRole returns all identities with the given role.
+func (v *Vault) GetByRole(role string) []*Identity {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	var ids []*Identity
+	for _, id := range v.identities {
+		if strings.EqualFold(id.Role, role) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // List returns all identity names.
@@ -117,57 +168,8 @@ func (v *Vault) List() []string {
 	return names
 }
 
-// All returns all identities.
-func (v *Vault) All() []*Identity {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-
-	ids := make([]*Identity, 0, len(v.identities))
-	for _, id := range v.identities {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// IdentifyRequest determines which identity made a request by matching headers/cookies.
-func (v *Vault) IdentifyRequest(req *http.Request) string {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-
-	for name, id := range v.identities {
-		id.mu.RLock()
-
-		// Check header match
-		matched := false
-		for key, val := range id.Headers {
-			if req.Header.Get(key) == val {
-				matched = true
-				break
-			}
-		}
-
-		// Check cookie match
-		if !matched {
-			for _, c := range id.Cookies {
-				if rc, err := req.Cookie(c.Name); err == nil && rc.Value == c.Value {
-					matched = true
-					break
-				}
-			}
-		}
-
-		id.mu.RUnlock()
-
-		if matched {
-			return name
-		}
-	}
-
-	return ""
-}
-
-// ApplyAuth applies an identity's authentication to an HTTP request.
-func (v *Vault) ApplyAuth(req *http.Request, identityName string) error {
+// InjectAuth applies an identity's authentication to an HTTP request.
+func (v *Vault) InjectAuth(req *http.Request, identityName string) error {
 	id, err := v.Get(identityName)
 	if err != nil {
 		return err
@@ -187,26 +189,83 @@ func (v *Vault) ApplyAuth(req *http.Request, identityName string) error {
 	return nil
 }
 
+// HeadersFor returns the authentication headers for an identity.
+func (v *Vault) HeadersFor(identityName string) (map[string]string, error) {
+	id, err := v.Get(identityName)
+	if err != nil {
+		return nil, err
+	}
+
+	id.mu.RLock()
+	defer id.mu.RUnlock()
+
+	result := make(map[string]string, len(id.Headers))
+	for k, val := range id.Headers {
+		result[k] = val
+	}
+	return result, nil
+}
+
+// IdentifyRequest determines which identity made a request by matching headers/cookies.
+func (v *Vault) IdentifyRequest(req *http.Request) string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	for name, id := range v.identities {
+		id.mu.RLock()
+
+		matched := false
+		for key, val := range id.Headers {
+			if req.Header.Get(key) == val {
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			for _, c := range id.Cookies {
+				if rc, err := req.Cookie(c.Name); err == nil && rc.Value == c.Value {
+					matched = true
+					break
+				}
+			}
+		}
+
+		id.mu.RUnlock()
+
+		if matched {
+			return name
+		}
+	}
+
+	return ""
+}
+
 // IsExpired checks if an identity's token has expired.
 func (id *Identity) IsExpired() bool {
 	id.mu.RLock()
 	defer id.mu.RUnlock()
 
 	if id.ExpiresAt.IsZero() {
-		return false // No expiry known
+		return false
 	}
 	return time.Now().After(id.ExpiresAt)
 }
 
-// IsExpiringSoon checks if a token will expire within the given duration.
-func (id *Identity) IsExpiringSoon(within time.Duration) bool {
+// TimeUntilExpiry returns the duration until the token expires.
+// Returns 0 if already expired or no expiry is known.
+func (id *Identity) TimeUntilExpiry() time.Duration {
 	id.mu.RLock()
 	defer id.mu.RUnlock()
 
 	if id.ExpiresAt.IsZero() {
-		return false
+		return 0
 	}
-	return time.Now().Add(within).After(id.ExpiresAt)
+	d := time.Until(id.ExpiresAt)
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // UpdateToken updates an identity's authentication token.
@@ -214,67 +273,6 @@ func (id *Identity) UpdateToken(headerKey, headerValue string, expiresAt time.Ti
 	id.mu.Lock()
 	defer id.mu.Unlock()
 
-	if id.Headers == nil {
-		id.Headers = make(map[string]string)
-	}
 	id.Headers[headerKey] = headerValue
 	id.ExpiresAt = expiresAt
-}
-
-// DetectTokenType auto-detects the authentication token type from headers and cookies.
-func DetectTokenType(headers map[string]string, cookies []*http.Cookie) TokenType {
-	if auth, ok := headers["Authorization"]; ok {
-		if strings.HasPrefix(auth, "Bearer ") {
-			token := strings.TrimPrefix(auth, "Bearer ")
-			parts := strings.Split(token, ".")
-			if len(parts) == 3 {
-				// Validate it's actually a JWT by checking base64 decode
-				if _, err := base64.RawURLEncoding.DecodeString(parts[0]); err == nil {
-					if _, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
-						return TokenTypeJWT
-					}
-				}
-			}
-			return TokenTypeBearer
-		}
-		if strings.HasPrefix(auth, "Basic ") {
-			return TokenTypeBasic
-		}
-	}
-
-	if len(cookies) > 0 {
-		return TokenTypeCookie
-	}
-
-	return TokenTypeUnknown
-}
-
-// ExtractJWTExpiry decodes a JWT token and extracts the expiration time.
-func ExtractJWTExpiry(token string) (time.Time, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}, fmt.Errorf("invalid JWT format: expected 3 parts, got %d", len(parts))
-	}
-
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return time.Time{}, fmt.Errorf("decoding JWT payload: %w", err)
-	}
-
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}, fmt.Errorf("parsing JWT claims: %w", err)
-	}
-
-	exp, ok := claims["exp"]
-	if !ok {
-		return time.Time{}, fmt.Errorf("JWT has no exp claim")
-	}
-
-	expFloat, ok := exp.(float64)
-	if !ok {
-		return time.Time{}, fmt.Errorf("JWT exp claim is not a number")
-	}
-
-	return time.Unix(int64(expFloat), 0), nil
 }

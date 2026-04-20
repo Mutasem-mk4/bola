@@ -6,91 +6,104 @@ package analyzer
 import (
 	"testing"
 
+	"github.com/Mutasem-mk4/bola/internal/config"
 	"github.com/Mutasem-mk4/bola/internal/graph"
 )
 
-func TestAnalyze_BlockedAccess(t *testing.T) {
-	a := New(0.85, []string{"error", "unauthorized"})
-
-	pair := &graph.TestPair{
-		OriginalRequest: &graph.CapturedRequest{
-			StatusCode:   200,
-			ResponseBody: []byte(`{"id": 1, "name": "test"}`),
-		},
-		TestRequest: &graph.CapturedRequest{
-			StatusCode:   403,
-			ResponseBody: []byte(`{"error": "forbidden"}`),
+func testConfig() *config.Config {
+	return &config.Config{
+		Analysis: config.AnalysisConfig{
+			SimilarityThreshold: 0.85,
+			DetectErrorPatterns: []string{"error", "unauthorized", "forbidden", "access denied"},
 		},
 	}
+}
 
-	result := a.Analyze(pair)
-	if result.BOLA {
-		t.Error("expected no BOLA for 403 response")
+func TestAnalyze_BlockedAccess(t *testing.T) {
+	cfg := testConfig()
+
+	result := Analyze(
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: []byte(`{"id": 1}`)},
+		&graph.CapturedRequest{StatusCode: 403, ResponseBody: []byte(`{"error": "forbidden"}`)},
+		cfg,
+	)
+
+	if result != nil {
+		t.Error("expected nil (blocked access)")
 	}
 }
 
 func TestAnalyze_HighConfidence(t *testing.T) {
-	a := New(0.85, []string{"error", "unauthorized"})
+	cfg := testConfig()
+	body := []byte(`{"id": 1, "name": "Alice", "email": "alice@test.com", "role": "user"}`)
 
-	body := []byte(`{"id": 1, "name": "test", "email": "user@test.com", "role": "user"}`)
+	result := Analyze(
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: body},
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: body},
+		cfg,
+	)
 
-	pair := &graph.TestPair{
-		OriginalRequest: &graph.CapturedRequest{
-			StatusCode:   200,
-			ResponseBody: body,
-		},
-		TestRequest: &graph.CapturedRequest{
-			StatusCode:   200,
-			ResponseBody: body, // identical = definitely BOLA
-		},
+	if result == nil {
+		t.Fatal("expected finding for identical responses")
 	}
-
-	result := a.Analyze(pair)
-	if !result.BOLA {
-		t.Error("expected BOLA for identical responses")
-	}
-	if result.Confidence != graph.ConfidenceHigh {
+	if result.Confidence != "HIGH" {
 		t.Errorf("expected HIGH confidence, got %s (score: %.1f)", result.Confidence, result.Score)
+	}
+	if result.Score < 80 {
+		t.Errorf("score should be >= 80, got %.1f", result.Score)
 	}
 }
 
 func TestAnalyze_ErrorBody200(t *testing.T) {
-	a := New(0.85, []string{"error", "unauthorized", "access denied"})
+	cfg := testConfig()
 
-	pair := &graph.TestPair{
-		OriginalRequest: &graph.CapturedRequest{
-			StatusCode:   200,
-			ResponseBody: []byte(`{"id": 1, "name": "test"}`),
-		},
-		TestRequest: &graph.CapturedRequest{
+	result := Analyze(
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: []byte(`{"id": 1, "name": "test"}`)},
+		&graph.CapturedRequest{
 			StatusCode:   200,
 			ResponseBody: []byte(`{"error": "access denied", "message": "You cannot access this resource"}`),
 		},
-	}
+		cfg,
+	)
 
-	result := a.Analyze(pair)
-	if result.BOLA && result.Confidence == graph.ConfidenceHigh {
-		t.Error("200 with error body should not be HIGH confidence BOLA")
+	// Should either be nil (not a finding) or low confidence due to error penalty
+	if result != nil && result.Confidence == "HIGH" {
+		t.Error("200 with error body should NOT be HIGH confidence")
 	}
 }
 
-func TestComputeJSONSimilarity(t *testing.T) {
+func TestAnalyze_DifferentStructure(t *testing.T) {
+	cfg := testConfig()
+
+	result := Analyze(
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: []byte(`{"id": 1, "name": "Alice", "email": "alice@test.com"}`)},
+		&graph.CapturedRequest{StatusCode: 200, ResponseBody: []byte(`{"status": "ok", "timestamp": "2025-01-01"}`)},
+		cfg,
+	)
+
+	// Different JSON structures → should be LOW or nil
+	if result != nil && result.Confidence == "HIGH" {
+		t.Error("different structures should not be HIGH confidence")
+	}
+}
+
+func TestComputeKeySimilarity(t *testing.T) {
 	body1 := []byte(`{"id": 1, "name": "Alice", "email": "alice@test.com"}`)
 	body2 := []byte(`{"id": 2, "name": "Bob", "email": "bob@test.com"}`)
 
-	sim := ComputeJSONSimilarity(body1, body2)
+	sim := ComputeKeySimilarity(body1, body2)
 	if sim < 0.9 {
-		t.Errorf("expected similarity > 0.9 for identical structures, got %f", sim)
+		t.Errorf("identical structures should have similarity > 0.9, got %f", sim)
 	}
 }
 
-func TestComputeJSONSimilarity_Different(t *testing.T) {
+func TestComputeKeySimilarity_Different(t *testing.T) {
 	body1 := []byte(`{"id": 1, "name": "Alice"}`)
 	body2 := []byte(`{"error": "not found", "message": "Resource does not exist"}`)
 
-	sim := ComputeJSONSimilarity(body1, body2)
+	sim := ComputeKeySimilarity(body1, body2)
 	if sim > 0.5 {
-		t.Errorf("expected low similarity for different structures, got %f", sim)
+		t.Errorf("different structures should have low similarity, got %f", sim)
 	}
 }
 
@@ -100,7 +113,47 @@ func TestComputeValueSimilarity(t *testing.T) {
 
 	sim := ComputeValueSimilarity(body1, body2)
 	if sim != 1.0 {
-		t.Errorf("expected value similarity 1.0 for identical bodies, got %f", sim)
+		t.Errorf("identical bodies should have value similarity 1.0, got %f", sim)
+	}
+}
+
+func TestFlattenJSON(t *testing.T) {
+	body := []byte(`{"user": {"name": "Alice", "id": 42}, "status": "active"}`)
+	flat := FlattenJSON(body)
+
+	if flat["user.name"] != "Alice" {
+		t.Errorf("user.name: got %q", flat["user.name"])
+	}
+	if flat["user.id"] != "42" {
+		t.Errorf("user.id: got %q", flat["user.id"])
+	}
+	if flat["status"] != "active" {
+		t.Errorf("status: got %q", flat["status"])
+	}
+}
+
+func TestDetectErrorIndicators(t *testing.T) {
+	patterns := []string{"error", "unauthorized", "forbidden"}
+
+	tests := []struct {
+		name     string
+		body     string
+		expected bool
+	}{
+		{"json error field", `{"error": "something failed"}`, true},
+		{"success false", `{"success": false, "message": "no access"}`, true},
+		{"status error", `{"status": "error"}`, true},
+		{"clean response", `{"id": 1, "name": "Alice"}`, false},
+		{"empty body", ``, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DetectErrorIndicators([]byte(tt.body), patterns)
+			if got != tt.expected {
+				t.Errorf("DetectErrorIndicators(%q) = %v, want %v", tt.body, got, tt.expected)
+			}
+		})
 	}
 }
 

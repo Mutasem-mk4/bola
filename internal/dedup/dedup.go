@@ -6,148 +6,101 @@ package dedup
 
 import (
 	"fmt"
-	"regexp"
+	"log/slog"
 	"strings"
 
 	"github.com/Mutasem-mk4/bola/internal/graph"
+	"github.com/Mutasem-mk4/bola/internal/proxy"
 )
 
-var (
-	uuidPattern    = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	mongoIDPattern = regexp.MustCompile(`[0-9a-fA-F]{24}`)
-	integerPattern = regexp.MustCompile(`^\d+$`)
-)
-
-// Deduplicator removes duplicate findings by normalizing paths
-// and keeping only the highest-confidence finding per unique pattern.
+// Deduplicator groups and deduplicates findings.
 type Deduplicator struct {
 	db *graph.DB
 }
 
-// New creates a new Deduplicator.
+// New creates a new deduplicator.
 func New(db *graph.DB) *Deduplicator {
 	return &Deduplicator{db: db}
 }
 
-// Run performs deduplication on all findings in the database.
-// It groups findings by normalized endpoint pattern and keeps
-// only the highest-confidence finding per group.
+// Run deduplicates all findings in the database.
+// Groups by (method + normalized_path + id_location), keeps highest confidence per group.
 func (d *Deduplicator) Run() error {
-	findings, err := d.db.ListFindings(graph.ConfidenceLow)
+	findings, err := d.db.AllFindings()
 	if err != nil {
-		return fmt.Errorf("listing findings: %w", err)
+		return fmt.Errorf("dedup: loading findings: %w", err)
 	}
 
 	if len(findings) == 0 {
 		return nil
 	}
 
-	// Group findings by normalized pattern
-	groups := make(map[string][]*graph.Finding)
+	// Group findings by their dedup key
+	type groupKey struct {
+		method         string
+		normalizedPath string
+		direction      string // "owner→tester" role direction
+	}
+
+	groups := make(map[groupKey][]*graph.Finding)
+
 	for _, f := range findings {
-		key := d.normalizeKey(f)
+		method, path := "", ""
+		if f.Endpoint != nil {
+			method = f.Endpoint.Method
+			path = f.Endpoint.Path
+		}
+
+		key := groupKey{
+			method:         method,
+			normalizedPath: proxy.NormalizePath(path),
+			direction:      normalizeRole(f.OwnerIdentity) + "→" + normalizeRole(f.TesterIdentity),
+		}
+
 		groups[key] = append(groups[key], f)
 	}
 
-	// For each group with multiple findings, keep only the best
+	// For each group with > 1 finding, mark all except the highest confidence as deduplicated
+	dedupCount := 0
 	for _, group := range groups {
 		if len(group) <= 1 {
 			continue
 		}
 
-		// Find the best finding (highest confidence, then highest similarity)
-		best := group[0]
-		for _, f := range group[1:] {
-			if confidenceRank(f.ConfidenceLevel) > confidenceRank(best.ConfidenceLevel) {
-				best = f
-			} else if f.ConfidenceLevel == best.ConfidenceLevel && f.Similarity > best.Similarity {
-				best = f
+		// Sort by confidence (HIGH > MEDIUM > LOW), then by similarity
+		bestIdx := 0
+		for i := 1; i < len(group); i++ {
+			if confidenceRank(group[i].ConfidenceLevel) > confidenceRank(group[bestIdx].ConfidenceLevel) {
+				bestIdx = i
+			} else if confidenceRank(group[i].ConfidenceLevel) == confidenceRank(group[bestIdx].ConfidenceLevel) &&
+				group[i].Similarity > group[bestIdx].Similarity {
+				bestIdx = i
 			}
 		}
 
-		// Mark duplicates with a note (we don't delete, just annotate)
-		for _, f := range group {
-			if f.ID != best.ID {
-				f.Notes = "[DEDUPLICATED] " + f.Notes
+		for i, f := range group {
+			if i != bestIdx {
+				if err := d.db.MarkDeduplicated(f.ID); err != nil {
+					slog.Error("dedup: marking finding",
+						"finding_id", f.ID,
+						"error", err,
+					)
+				}
+				dedupCount++
 			}
 		}
 	}
+
+	slog.Info("dedup: completed",
+		"total_findings", len(findings),
+		"deduplicated", dedupCount,
+		"unique_groups", len(groups),
+	)
 
 	return nil
 }
 
-// normalizeKey creates a deduplication key from a finding.
-// Findings with the same key are considered duplicates.
-func (d *Deduplicator) normalizeKey(f *graph.Finding) string {
-	method := ""
-	path := ""
-	if f.Endpoint != nil {
-		method = f.Endpoint.Method
-		path = f.Endpoint.Path
-	}
-
-	// The path should already be normalized from the proxy,
-	// but normalize again for safety
-	normPath := NormalizePath(path)
-
-	// Key: method + normalized path + identity pair direction
-	return fmt.Sprintf("%s:%s:%s->%s",
-		method,
-		normPath,
-		normalizeRole(f.OwnerIdentity),
-		normalizeRole(f.TesterIdentity),
-	)
-}
-
-// NormalizePath replaces ID-like segments with type placeholders.
-func NormalizePath(path string) string {
-	segments := strings.Split(path, "/")
-	for i, seg := range segments {
-		if seg == "" {
-			continue
-		}
-
-		if uuidPattern.MatchString(seg) {
-			segments[i] = "{uuid}"
-		} else if len(seg) == 24 && mongoIDPattern.MatchString(seg) {
-			segments[i] = "{mongoid}"
-		} else if integerPattern.MatchString(seg) {
-			segments[i] = "{id}"
-		} else if isLikelyHash(seg) {
-			segments[i] = "{hash}"
-		}
-	}
-	return strings.Join(segments, "/")
-}
-
-// isLikelyHash checks if a string looks like a hash or token.
-func isLikelyHash(s string) bool {
-	if len(s) < 16 {
-		return false
-	}
-	for _, r := range s {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
-			return false
-		}
-	}
-	return true
-}
-
-// normalizeRole extracts just the role concept (e.g., "user", "admin")
-// to prevent duplicate findings for user1→user2 and user3→user4
-// when they have the same role.
-func normalizeRole(identity string) string {
-	// If the identity name contains a role-like suffix, normalize it
-	lower := strings.ToLower(identity)
-	for _, role := range []string{"admin", "user", "editor", "guest", "viewer"} {
-		if strings.Contains(lower, role) {
-			return role
-		}
-	}
-	return identity
-}
-
-// confidenceRank returns a numeric rank for confidence level comparison.
+// confidenceRank returns a numeric rank for confidence ordering.
 func confidenceRank(c graph.Confidence) int {
 	switch c {
 	case graph.ConfidenceHigh:
@@ -159,4 +112,16 @@ func confidenceRank(c graph.Confidence) int {
 	default:
 		return 0
 	}
+}
+
+// normalizeRole normalizes identity/role names for grouping.
+func normalizeRole(identity string) string {
+	lower := strings.ToLower(identity)
+	if strings.Contains(lower, "admin") || strings.Contains(lower, "super") {
+		return "admin"
+	}
+	if strings.Contains(lower, "guest") || strings.Contains(lower, "anon") || strings.Contains(lower, "unauth") {
+		return "guest"
+	}
+	return "user"
 }

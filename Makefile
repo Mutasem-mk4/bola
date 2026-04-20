@@ -1,77 +1,89 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025 Mutasem Kharma
-#
-# Makefile for bola — BOLA/IDOR detection engine
-#
-# Required tools:
-#   - Go >= 1.21
-#
-# Typical workflow:
-#   make build      # build the bola binary
-#   make test       # run all tests
-#   make install    # install to /usr/bin and /usr/share/man
+# Makefile for bola — Identity Orchestration Engine for BOLA/IDOR Detection
 
-.PHONY: build build-only install uninstall clean lint test man completions dev
+VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+GO_VERSION  := $(shell go version | awk '{print $$3}')
+BINARY      := bola
+DIST        := dist
+MODULE      := github.com/Mutasem-mk4/bola
+LDFLAGS     := -s -w -X main.version=$(VERSION) -X main.buildGoVersion=$(GO_VERSION)
+BUILD_FLAGS := -trimpath -ldflags="$(LDFLAGS)"
 
-# Version info
-VERSION     ?= 0.1.0
-GO_VERSION   = $(shell go version 2>/dev/null | awk '{print $$3}')
-GOARCH      ?= $(shell go env GOARCH)
-DESTDIR     ?=
+.PHONY: all build build-arm64 build-only test lint clean install dev check-build help
 
-# Build flags — static binary, no CGO
-LDFLAGS = -s -w \
-	-X github.com/Mutasem-mk4/bola/cmd/bola.Version=$(VERSION) \
-	-X github.com/Mutasem-mk4/bola/cmd/bola.BuildGoVersion=$(GO_VERSION)
+all: lint test build
 
-# Build the bola binary (default target).
-build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -trimpath \
-		-ldflags="$(LDFLAGS)" -o bin/bola ./cmd/bola
+## build: Build static binary for linux/amd64
+build: test
+	@echo "==> Building bola $(VERSION) for linux/amd64"
+	@mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o $(DIST)/$(BINARY) ./cmd/bola
+	@echo "==> Binary: $(DIST)/$(BINARY)"
 
-# Build without setting GOOS (for local dev on any platform).
+## build-arm64: Build static binary for linux/arm64
+build-arm64: test
+	@echo "==> Building bola $(VERSION) for linux/arm64"
+	@mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(BUILD_FLAGS) -o $(DIST)/$(BINARY)-arm64 ./cmd/bola
+	@echo "==> Binary: $(DIST)/$(BINARY)-arm64"
+
+## build-only: Build without running tests first
 build-only:
-	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/bola ./cmd/bola
+	@mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=linux GOARCH=$${GOARCH:-amd64} go build $(BUILD_FLAGS) -o $(DIST)/$(BINARY) ./cmd/bola
 
-# Install bola binary and man page to system paths.
-# Respects DESTDIR for package building (e.g., dpkg-buildpackage).
-install: build
-	install -Dm 0755 bin/bola $(DESTDIR)/usr/bin/bola
-	install -Dm 0644 man/bola.1 $(DESTDIR)/usr/share/man/man1/bola.1
-
-# Uninstall bola from system paths.
-uninstall:
-	rm -f $(DESTDIR)/usr/bin/bola
-	rm -f $(DESTDIR)/usr/share/man/man1/bola.1
-
-# Clean build artifacts.
-clean:
-	rm -rf bin/ dist/ release-dist/
-	rm -f coverage.out
-
-# Run golangci-lint.
-lint:
-	golangci-lint run ./...
-
-# Run all tests with race detector.
+## test: Run all tests with race detector and coverage
 test:
-	go test -v -race -coverprofile=coverage.out ./...
-	go tool cover -func=coverage.out | tail -1
+	@echo "==> Running tests..."
+	go test -race -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | tail -1
 
-# Compress man page for distribution.
-man:
-	gzip -k man/bola.1
+## lint: Run golangci-lint
+lint:
+	@echo "==> Linting..."
+	golangci-lint run --timeout=5m
 
-# Generate shell completions.
-completions: build
-	bin/bola completion bash > completions/bola.bash
-	bin/bola completion zsh  > completions/bola.zsh
-	bin/bola completion fish > completions/bola.fish
+## clean: Remove build artifacts
+clean:
+	@echo "==> Cleaning..."
+	rm -rf $(DIST)/ coverage.out bola-report.* bola.db
 
-# Cross-compilation check (build verification, not functional on non-Linux).
+## install: Install binary and man page
+install: build
+	@echo "==> Installing bola to /usr/local/bin"
+	install -D -m 0755 $(DIST)/$(BINARY) /usr/local/bin/$(BINARY)
+	install -D -m 0644 man/bola.1 /usr/share/man/man1/bola.1
+	@echo "==> Installed. Run 'bola --help' to get started."
+
+## uninstall: Remove installed files
+uninstall:
+	rm -f /usr/local/bin/$(BINARY)
+	rm -f /usr/share/man/man1/bola.1
+
+## dev: Quick dev cycle (test + build for current OS)
+dev: test
+	@mkdir -p $(DIST)
+	go build $(BUILD_FLAGS) -o $(DIST)/$(BINARY) ./cmd/bola
+	@echo "==> Built $(DIST)/$(BINARY)"
+
+## check-build: Cross-compile check for both architectures
 check-build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="$(LDFLAGS)" -o /dev/null ./cmd/bola
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="$(LDFLAGS)" -o /dev/null ./cmd/bola
+	@echo "==> Cross-compile check: linux/amd64"
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o /dev/null ./cmd/bola
+	@echo "    ✓ linux/amd64"
+	@echo "==> Cross-compile check: linux/arm64"
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(BUILD_FLAGS) -o /dev/null ./cmd/bola
+	@echo "    ✓ linux/arm64"
 
-# Quick development cycle: test + build.
-dev: test build-only
+## completions: Generate shell completions
+completions:
+	@mkdir -p completions
+	go run ./cmd/bola completion bash > completions/bola.bash
+	go run ./cmd/bola completion zsh  > completions/bola.zsh
+	@echo "==> Shell completions generated"
+
+## help: Show this help
+help:
+	@echo "bola $(VERSION) — Build targets:"
+	@echo ""
+	@grep -E '^## ' Makefile | sed 's/## /  /' | sort

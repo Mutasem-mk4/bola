@@ -4,6 +4,7 @@
 package reporter
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,12 +29,7 @@ func sampleFindings() []*graph.Finding {
 			CurlCommand:     "curl -X GET 'https://api.test.com/api/v1/users/123' -H 'Authorization: Bearer evil'",
 			Notes:           "Full data returned",
 			CreatedAt:       time.Now(),
-			Endpoint: &graph.Endpoint{
-				ID:      1,
-				Method:  "GET",
-				Path:    "/api/v1/users/{id}",
-				RawPath: "/api/v1/users/123",
-			},
+			Endpoint:        &graph.Endpoint{ID: 1, Method: "GET", Path: "/api/v1/users/{id}"},
 		},
 		{
 			ID:              2,
@@ -48,72 +44,77 @@ func sampleFindings() []*graph.Finding {
 			CurlCommand:     "curl -X GET 'https://api.test.com/api/v1/orders/456'",
 			Notes:           "Partial data match",
 			CreatedAt:       time.Now(),
-			Endpoint: &graph.Endpoint{
-				ID:      2,
-				Method:  "GET",
-				Path:    "/api/v1/orders/{id}",
-				RawPath: "/api/v1/orders/456",
-			},
+			Endpoint:        &graph.Endpoint{ID: 2, Method: "GET", Path: "/api/v1/orders/{id}"},
 		},
 	}
 }
 
 func TestPrintTerminal(t *testing.T) {
-	// Just ensure it doesn't panic
-	PrintTerminal(sampleFindings())
-	PrintTerminal(nil)
-	PrintTerminal([]*graph.Finding{})
+	// Should not panic
+	PrintBanner("test")
+	PrintSummary(graph.Stats{Endpoints: 5, Resources: 10, Requests: 20, Findings: 2})
+	PrintFindings(sampleFindings())
+	PrintFindings(nil) // empty findings
 }
 
-func TestWriteJSON(t *testing.T) {
+func TestExportJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "report.json")
 
-	if err := WriteJSON(sampleFindings(), path); err != nil {
-		t.Fatalf("writing JSON report: %v", err)
+	err := ExportJSON(sampleFindings(), path, "v0.1.0-test")
+	if err != nil {
+		t.Fatalf("export JSON: %v", err)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("reading JSON report: %v", err)
+		t.Fatalf("reading JSON: %v", err)
 	}
 
-	content := string(data)
-	if !strings.Contains(content, `"tool": "bola"`) {
-		t.Error("JSON report should contain tool name")
+	var report JSONReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("parsing JSON: %v", err)
 	}
-	if !strings.Contains(content, `"confidence": "HIGH"`) {
-		t.Error("JSON report should contain HIGH confidence finding")
+
+	if report.Tool != "bola" {
+		t.Errorf("tool: got %q", report.Tool)
 	}
-	if !strings.Contains(content, `"high": 1`) {
-		t.Error("JSON report should have 1 high finding in summary")
+	if report.Summary.Total != 2 {
+		t.Errorf("total: got %d", report.Summary.Total)
+	}
+	if report.Summary.High != 1 {
+		t.Errorf("high: got %d", report.Summary.High)
+	}
+	if len(report.Findings) != 2 {
+		t.Errorf("findings: got %d", len(report.Findings))
 	}
 }
 
-func TestWriteMarkdown(t *testing.T) {
+func TestExportMarkdown(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "report.md")
 
-	if err := WriteMarkdown(sampleFindings(), path, "https://api.test.com"); err != nil {
-		t.Fatalf("writing Markdown report: %v", err)
+	err := ExportMarkdown(sampleFindings(), path, "https://api.test.com")
+	if err != nil {
+		t.Fatalf("export markdown: %v", err)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("reading Markdown report: %v", err)
+		t.Fatalf("reading markdown: %v", err)
 	}
 
 	content := string(data)
 	if !strings.Contains(content, "BOLA/IDOR Vulnerability Report") {
-		t.Error("should contain report title")
+		t.Error("missing title")
 	}
 	if !strings.Contains(content, "Steps to Reproduce") {
-		t.Error("should contain steps to reproduce")
-	}
-	if !strings.Contains(content, "Impact") {
-		t.Error("should contain impact section")
+		t.Error("missing steps section")
 	}
 	if !strings.Contains(content, "curl") {
-		t.Error("should contain curl reproduction command")
+		t.Error("missing curl command")
+	}
+	if !strings.Contains(content, "Impact") {
+		t.Error("missing impact section")
 	}
 }

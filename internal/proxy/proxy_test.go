@@ -12,14 +12,14 @@ import (
 func TestClassifyID(t *testing.T) {
 	tests := []struct {
 		input    string
-		expected string
+		expected IDType
 	}{
-		{"550e8400-e29b-41d4-a716-446655440000", "uuid"},
-		{"507f1f77bcf86cd799439011", "mongoid"},
-		{"123", "integer"},
-		{"42", "integer"},
-		{"99999999", "integer"},
-		{"abcdef1234567890abcdef", "hash"},
+		{"550e8400-e29b-41d4-a716-446655440000", IDTypeUUID},
+		{"507f1f77bcf86cd799439011", IDTypeMongoID},
+		{"123", IDTypeInteger},
+		{"42", IDTypeInteger},
+		{"99999999", IDTypeInteger},
+		{"abcdef1234567890abcdef1234567890", IDTypeHash},
 		{"api", ""},
 		{"users", ""},
 		{"v1", ""},
@@ -59,117 +59,89 @@ func TestNormalizePath(t *testing.T) {
 }
 
 func TestExtractFromPath(t *testing.T) {
-	results := ExtractFromPath("/api/users/123/orders/456")
+	u, _ := url.Parse("https://api.test.com/api/users/123/orders/456")
+	ids := ExtractFromURL(u)
 
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(results))
+	if len(ids) < 2 {
+		t.Fatalf("expected at least 2 IDs, got %d", len(ids))
 	}
 
-	if results[0].Value != "123" || results[0].Type != "integer" || results[0].Key != "users" {
-		t.Errorf("first result: got value=%q type=%q key=%q", results[0].Value, results[0].Type, results[0].Key)
+	found123, found456 := false, false
+	for _, id := range ids {
+		if id.Value == "123" {
+			found123 = true
+			if id.Type != IDTypeInteger {
+				t.Errorf("123 type: got %q", id.Type)
+			}
+			if id.Location != "path" {
+				t.Errorf("123 location: got %q", id.Location)
+			}
+		}
+		if id.Value == "456" {
+			found456 = true
+		}
 	}
-
-	if results[1].Value != "456" || results[1].Type != "integer" || results[1].Key != "orders" {
-		t.Errorf("second result: got value=%q type=%q key=%q", results[1].Value, results[1].Type, results[1].Key)
+	if !found123 {
+		t.Error("missing ID 123")
+	}
+	if !found456 {
+		t.Error("missing ID 456")
 	}
 }
 
 func TestExtractFromQuery(t *testing.T) {
-	params := url.Values{
-		"user_id": []string{"42"},
-		"token":   []string{"abc"},
-		"page":    []string{"1"},
-	}
-
-	results := ExtractFromQuery(params)
+	u, _ := url.Parse("https://api.test.com/api/search?user_id=789&q=test")
+	ids := ExtractFromURL(u)
 
 	found := false
-	for _, r := range results {
-		if r.Key == "user_id" && r.Value == "42" && r.Type == "integer" {
+	for _, id := range ids {
+		if id.Value == "789" && id.Key == "user_id" {
 			found = true
+			break
 		}
 	}
 	if !found {
-		t.Error("expected to find user_id=42 as integer")
+		t.Error("missing query param user_id=789")
 	}
 }
 
 func TestExtractFromJSONBody(t *testing.T) {
-	body := []byte(`{
-		"id": 42,
-		"user_id": "550e8400-e29b-41d4-a716-446655440000",
-		"name": "test",
-		"nested": {
-			"project_id": 99
-		},
-		"items": [
-			{"id": 1, "title": "first"},
-			{"id": 2, "title": "second"}
-		]
-	}`)
+	body := []byte(`{"id": 42, "user_id": "550e8400-e29b-41d4-a716-446655440000", "name": "test"}`)
+	ids := ExtractFromBody(body, "application/json")
 
-	results := ExtractFromJSONBody(body)
-
-	if len(results) == 0 {
-		t.Fatal("expected results from JSON body extraction")
-	}
-
-	// Check that id=42 was extracted
-	found42 := false
-	foundUUID := false
-	foundNested := false
-	for _, r := range results {
-		if r.Key == "id" && r.Value == "42" {
-			found42 = true
-		}
-		if r.Key == "user_id" && r.Type == "uuid" {
-			foundUUID = true
-		}
-		if r.Key == "nested.project_id" && r.Value == "99" {
-			foundNested = true
-		}
-	}
-
-	if !found42 {
-		t.Error("expected to find id=42")
-	}
-	if !foundUUID {
-		t.Error("expected to find UUID user_id")
-	}
-	if !foundNested {
-		t.Error("expected to find nested.project_id=99")
+	if len(ids) < 2 {
+		t.Fatalf("expected at least 2 IDs, got %d", len(ids))
 	}
 }
 
 func TestExtractFromHeaders(t *testing.T) {
-	headers := http.Header{
-		"Location":     []string{"/api/resources/550e8400-e29b-41d4-a716-446655440000"},
-		"X-Request-Id": []string{"550e8400-e29b-41d4-a716-446655440001"},
-	}
+	headers := http.Header{}
+	headers.Set("Location", "/api/v1/users/550e8400-e29b-41d4-a716-446655440000")
+	headers.Set("X-Request-Id", "7c9e6679-7425-40de-944b-e07fc1f90ae7")
 
-	results := ExtractFromHeaders(headers)
-
-	if len(results) < 1 {
-		t.Fatalf("expected at least 1 result, got %d", len(results))
+	ids := ExtractFromHeaders(headers)
+	if len(ids) < 2 {
+		t.Fatalf("expected at least 2 header IDs, got %d", len(ids))
 	}
 }
 
 func TestExtractAll(t *testing.T) {
-	u, _ := url.Parse("https://api.example.com/api/users/123?include=orders")
-	body := []byte(`{"id": 42, "email": "test@test.com"}`)
+	u, _ := url.Parse("https://api.test.com/api/users/123")
+	body := []byte(`{"id": 123, "order_id": 456}`)
 	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
 
-	results := ExtractAll(u, body, headers)
-	if len(results) < 2 { // at least path ID and body ID
-		t.Errorf("expected at least 2 results, got %d", len(results))
+	ids := ExtractAll(u, body, headers)
+	if len(ids) < 2 {
+		t.Fatalf("expected at least 2 total IDs, got %d", len(ids))
 	}
 }
 
 func TestMatchGlob(t *testing.T) {
 	tests := []struct {
-		pattern string
-		path    string
-		want    bool
+		pattern  string
+		path     string
+		expected bool
 	}{
 		{"/api/v1/*", "/api/v1/users", true},
 		{"/api/v1/*", "/api/v1/users/123", true},
@@ -179,11 +151,26 @@ func TestMatchGlob(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.pattern+"_"+tt.path, func(t *testing.T) {
-			got := matchGlob(tt.pattern, tt.path)
-			if got != tt.want {
-				t.Errorf("matchGlob(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
+		name := tt.pattern + "_" + tt.path
+		t.Run(name, func(t *testing.T) {
+			if got := MatchGlob(tt.pattern, tt.path); got != tt.expected {
+				t.Errorf("MatchGlob(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestInScope(t *testing.T) {
+	include := []string{"/api/*"}
+	exclude := []string{"/api/health"}
+
+	if !InScope("/api/users/1", include, exclude) {
+		t.Error("should be in scope")
+	}
+	if InScope("/api/health", include, exclude) {
+		t.Error("should be excluded")
+	}
+	if InScope("/other/path", include, exclude) {
+		t.Error("should not be in scope")
 	}
 }

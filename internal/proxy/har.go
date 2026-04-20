@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,12 +18,17 @@ import (
 	"github.com/Mutasem-mk4/bola/internal/vault"
 )
 
-// HARLog represents the top-level HAR 1.2 structure.
+// HAR 1.2 structures for parsing Burp/ZAP exports.
+
+// HAR is the top-level HAR 1.2 file structure.
+type HAR struct {
+	Log HARLog `json:"log"`
+}
+
+// HARLog contains the HAR entries.
 type HARLog struct {
-	Log struct {
-		Version string     `json:"version"`
-		Entries []HAREntry `json:"entries"`
-	} `json:"log"`
+	Version string     `json:"version"`
+	Entries []HAREntry `json:"entries"`
 }
 
 // HAREntry represents a single HTTP exchange in a HAR file.
@@ -31,229 +37,243 @@ type HAREntry struct {
 	Response HARResponse `json:"response"`
 }
 
-// HARRequest represents an HTTP request in HAR format.
+// HARRequest represents the request portion of a HAR entry.
 type HARRequest struct {
-	Method      string           `json:"method"`
-	URL         string           `json:"url"`
-	Headers     []HARNameValue   `json:"headers"`
-	QueryString []HARNameValue   `json:"queryString"`
-	PostData    *HARPostData     `json:"postData,omitempty"`
-	Cookies     []HARCookie      `json:"cookies"`
+	Method      string      `json:"method"`
+	URL         string      `json:"url"`
+	Headers     []HARHeader `json:"headers"`
+	QueryString []HARQuery  `json:"queryString"`
+	PostData    *HARPost    `json:"postData,omitempty"`
+	Cookies     []HARCookie `json:"cookies"`
 }
 
-// HARResponse represents an HTTP response in HAR format.
+// HARResponse represents the response portion of a HAR entry.
 type HARResponse struct {
-	Status      int            `json:"status"`
-	Headers     []HARNameValue `json:"headers"`
-	Content     HARContent     `json:"content"`
+	Status  int          `json:"status"`
+	Headers []HARHeader  `json:"headers"`
+	Content HARContent   `json:"content"`
 }
 
-// HARNameValue is a generic name-value pair used in HAR.
-type HARNameValue struct {
+// HARHeader is a name-value header pair.
+type HARHeader struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
 
-// HARPostData represents POST request data.
-type HARPostData struct {
+// HARQuery is a query string parameter.
+type HARQuery struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// HARPost represents POST/PUT request body data.
+type HARPost struct {
 	MimeType string `json:"mimeType"`
 	Text     string `json:"text"`
 }
 
-// HARContent represents response body content.
+// HARContent represents the response body.
 type HARContent struct {
 	Size     int    `json:"size"`
 	MimeType string `json:"mimeType"`
 	Text     string `json:"text"`
 }
 
-// HARCookie represents a cookie in HAR format.
+// HARCookie represents a cookie in the HAR entry.
 type HARCookie struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
-	Path   string `json:"path"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
-// ImportHAR reads a HAR file and populates the resource graph.
-// Returns the number of entries processed.
-func ImportHAR(path string, cfg *config.Config, db *graph.DB, v *vault.Vault) (int, error) {
-	f, err := os.Open(path)
+// ImportHAR parses a HAR file and populates the resource graph.
+func ImportHAR(harPath string, cfg *config.Config, db *graph.DB, v *vault.Vault) (int, error) {
+	data, err := os.ReadFile(harPath)
 	if err != nil {
-		return 0, fmt.Errorf("opening HAR file: %w", err)
-	}
-	defer f.Close()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return 0, fmt.Errorf("reading HAR file: %w", err)
+		return 0, fmt.Errorf("proxy: reading HAR file: %w", err)
 	}
 
-	var har HARLog
+	var har HAR
 	if err := json.Unmarshal(data, &har); err != nil {
-		return 0, fmt.Errorf("parsing HAR file: %w", err)
+		return 0, fmt.Errorf("proxy: parsing HAR JSON: %w", err)
 	}
 
-	count := 0
+	imported := 0
 	for _, entry := range har.Log.Entries {
-		if err := processHAREntry(entry, cfg, db, v); err != nil {
-			// Log but continue processing other entries
-			fmt.Printf("[!] Error processing HAR entry %s %s: %v\n",
-				entry.Request.Method, entry.Request.URL, err)
+		parsedURL, err := url.Parse(entry.Request.URL)
+		if err != nil {
+			slog.Debug("proxy: skipping invalid URL in HAR", "url", entry.Request.URL)
 			continue
 		}
-		count++
-	}
 
-	return count, nil
-}
-
-// processHAREntry processes a single HAR entry into the resource graph.
-func processHAREntry(entry HAREntry, cfg *config.Config, db *graph.DB, v *vault.Vault) error {
-	reqURL, err := url.Parse(entry.Request.URL)
-	if err != nil {
-		return fmt.Errorf("parsing URL: %w", err)
-	}
-
-	// Check scope
-	if !isPathInScope(reqURL.Path, cfg) {
-		return nil
-	}
-
-	method := entry.Request.Method
-	rawPath := reqURL.Path
-	normalizedPath := NormalizePath(rawPath)
-	contentType := ""
-	for _, h := range entry.Response.Headers {
-		if strings.EqualFold(h.Name, "Content-Type") {
-			contentType = h.Value
-			break
+		// Check scope
+		if !InScope(parsedURL.Path, cfg.Target.Scope.Include, cfg.Target.Scope.Exclude) {
+			continue
 		}
-	}
 
-	// Identify the user by matching request headers against vault identities
-	identity := identifyHARRequest(entry.Request, v)
+		// Build headers map
+		headers := make(map[string]string)
+		for _, h := range entry.Request.Headers {
+			headers[h.Name] = h.Value
+		}
 
-	// Upsert endpoint
-	ep, err := db.UpsertEndpoint(method, normalizedPath, rawPath, contentType)
-	if err != nil {
-		return fmt.Errorf("upserting endpoint: %w", err)
-	}
+		// Identify which identity this request belongs to
+		identity := identifyFromHAR(entry, v)
+		if identity == "" {
+			slog.Debug("proxy: unidentified HAR entry", "url", entry.Request.URL)
+			identity = "unknown"
+		}
 
-	// Build header maps
-	reqHeaders := make(map[string]string)
-	for _, h := range entry.Request.Headers {
-		reqHeaders[h.Name] = h.Value
-	}
-	respHeaders := make(map[string]string)
-	for _, h := range entry.Response.Headers {
-		respHeaders[h.Name] = h.Value
-	}
+		// Normalize path
+		normalizedPath := NormalizePath(parsedURL.Path)
 
-	reqHeadersJSON, _ := json.Marshal(reqHeaders)
-	respHeadersJSON, _ := json.Marshal(respHeaders)
+		// Insert endpoint
+		endpointID, err := db.InsertEndpoint(entry.Request.Method, normalizedPath, parsedURL.Path)
+		if err != nil {
+			slog.Error("proxy: inserting endpoint from HAR", "error", err)
+			continue
+		}
 
-	var reqBody []byte
-	if entry.Request.PostData != nil {
-		reqBody = []byte(entry.Request.PostData.Text)
-	}
+		// Get request body
+		var bodyBytes []byte
+		if entry.Request.PostData != nil {
+			bodyBytes = []byte(entry.Request.PostData.Text)
+		}
 
-	respBody := []byte(entry.Response.Content.Text)
+		// Store headers as JSON
+		headersJSON, _ := json.Marshal(headers)
 
-	// Store captured request
-	_, err = db.InsertRequest(&graph.CapturedRequest{
-		EndpointID:      ep.ID,
-		Identity:        identity,
-		Method:          method,
-		URL:             entry.Request.URL,
-		Headers:         string(reqHeadersJSON),
-		Body:            reqBody,
-		StatusCode:      entry.Response.Status,
-		ResponseHeaders: string(respHeadersJSON),
-		ResponseBody:    respBody,
-		ResponseSize:    len(respBody),
-	})
-	if err != nil {
-		return fmt.Errorf("inserting request: %w", err)
-	}
+		// Get response headers
+		respHeaders := make(http.Header)
+		for _, h := range entry.Response.Headers {
+			respHeaders.Set(h.Name, h.Value)
+		}
 
-	// Extract object IDs
-	respHdr := harHeadersToHTTP(entry.Response.Headers)
-	extracted := ExtractAll(reqURL, respBody, respHdr)
+		respBody := []byte(entry.Response.Content.Text)
 
-	// Store resources
-	for _, ext := range extracted {
-		_, err := db.InsertResource(&graph.Resource{
-			EndpointID: ep.ID,
-			Identity:   identity,
-			ObjectID:   ext.Value,
-			IDType:     ext.Type,
-			IDLocation: ext.Location,
-			IDKey:      ext.Key,
+		// Insert captured request
+		_, err = db.InsertRequest(&graph.CapturedRequest{
+			EndpointID:      endpointID,
+			Identity:        identity,
+			Method:          entry.Request.Method,
+			URL:             entry.Request.URL,
+			Headers:         string(headersJSON),
+			Body:            bodyBytes,
+			StatusCode:      entry.Response.Status,
+			ResponseHeaders: marshalHeaders(respHeaders),
+			ResponseBody:    respBody,
+			ResponseSize:    len(respBody),
 		})
 		if err != nil {
+			slog.Error("proxy: inserting request from HAR", "error", err)
 			continue
 		}
+
+		// Extract object IDs from URL and response body
+		ids := ExtractAll(parsedURL, respBody, respHeaders)
+		prevResourceIDs := make([]int64, 0)
+
+		for _, oid := range ids {
+			resourceID, err := db.InsertResource(endpointID, identity, oid.Value, string(oid.Type), oid.Location, oid.Key)
+			if err != nil {
+				continue
+			}
+
+			// Create parent-child relationships from path hierarchy
+			for _, parentID := range prevResourceIDs {
+				_ = db.InsertRelationship(parentID, resourceID)
+			}
+			if oid.Location == "path" {
+				prevResourceIDs = append(prevResourceIDs, resourceID)
+			}
+		}
+
+		imported++
+		slog.Debug("proxy: imported HAR entry",
+			"method", entry.Request.Method,
+			"url", parsedURL.Path,
+			"identity", identity,
+			"ids_found", len(ids),
+		)
 	}
 
-	return nil
+	return imported, nil
 }
 
-// identifyHARRequest matches a HAR request against vault identities.
-func identifyHARRequest(req HARRequest, v *vault.Vault) string {
-	// Build an http.Request to use vault's IdentifyRequest
-	httpReq, err := http.NewRequest(req.Method, req.URL, nil)
+// identifyFromHAR matches a HAR entry to a vault identity by comparing auth headers/cookies.
+func identifyFromHAR(entry HAREntry, v *vault.Vault) string {
+	req, err := http.NewRequest(entry.Request.Method, entry.Request.URL, nil)
 	if err != nil {
-		return "unknown"
+		return ""
 	}
 
-	for _, h := range req.Headers {
-		httpReq.Header.Set(h.Name, h.Value)
+	for _, h := range entry.Request.Headers {
+		req.Header.Set(h.Name, h.Value)
 	}
 
-	for _, c := range req.Cookies {
-		httpReq.AddCookie(&http.Cookie{
-			Name:  c.Name,
-			Value: c.Value,
-		})
+	for _, c := range entry.Request.Cookies {
+		req.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 	}
 
-	if name := v.IdentifyRequest(httpReq); name != "" {
-		return name
-	}
-	return "unknown"
+	return v.IdentifyRequest(req)
 }
 
-// isPathInScope checks if a path is within the configured scope.
-func isPathInScope(path string, cfg *config.Config) bool {
-	if len(cfg.Target.Scope.Include) == 0 && len(cfg.Target.Scope.Exclude) == 0 {
+// marshalHeaders serializes http.Header to a JSON string.
+func marshalHeaders(headers http.Header) string {
+	m := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if len(v) > 0 {
+			m[k] = v[0]
+		}
+	}
+	data, _ := json.Marshal(m)
+	return string(data)
+}
+
+// InScope checks if a path matches the include/exclude filter patterns.
+func InScope(path string, include, exclude []string) bool {
+	if len(include) == 0 {
 		return true
 	}
 
-	for _, pattern := range cfg.Target.Scope.Exclude {
-		if matchGlob(pattern, path) {
+	inScope := false
+	for _, pattern := range include {
+		if MatchGlob(pattern, path) {
+			inScope = true
+			break
+		}
+	}
+	if !inScope {
+		return false
+	}
+
+	for _, pattern := range exclude {
+		if MatchGlob(pattern, path) {
 			return false
 		}
 	}
 
-	if len(cfg.Target.Scope.Include) == 0 {
+	return true
+}
+
+// MatchGlob performs a simple glob-style path match.
+// Supports * as a wildcard for one or more path segments.
+func MatchGlob(pattern, path string) bool {
+	if pattern == path {
 		return true
 	}
 
-	for _, pattern := range cfg.Target.Scope.Include {
-		if matchGlob(pattern, path) {
-			return true
-		}
+	if strings.HasSuffix(pattern, "/*") {
+		prefix := strings.TrimSuffix(pattern, "/*")
+		return strings.HasPrefix(path, prefix+"/") || path == prefix
+	}
+
+	if strings.HasSuffix(pattern, "*") {
+		prefix := strings.TrimSuffix(pattern, "*")
+		return strings.HasPrefix(path, prefix)
 	}
 
 	return false
 }
 
-// harHeadersToHTTP converts HAR headers to http.Header.
-func harHeadersToHTTP(headers []HARNameValue) http.Header {
-	h := make(http.Header)
-	for _, nv := range headers {
-		h.Set(nv.Name, nv.Value)
-	}
-	return h
-}
+// Ensure io import is used
+var _ = io.ReadAll
