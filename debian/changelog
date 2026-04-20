@@ -1,0 +1,12 @@
+bola (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * MITM HTTP/HTTPS proxy with resource graph building.
+  * Cross-identity authorization testing engine.
+  * Response comparison with confidence scoring.
+  * JSON, Markdown, and terminal report generation.
+  * HAR file import (Burp Suite / ZAP Proxy).
+  * JWT/Cookie/Bearer/OAuth2 token auto-detection.
+  * Smart path normalization and finding deduplication.
+
+ -- Mutasem Kharma <mutasem@bola.dev>  Sun, 20 Apr 2025 00:00:00 +0000

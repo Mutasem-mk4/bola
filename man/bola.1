@@ -1,0 +1,127 @@
+.TH BOLA 1 "2025" "bola 0.1.0" "User Commands"
+.SH NAME
+bola \- Identity Orchestration Engine for BOLA/IDOR Detection
+.SH SYNOPSIS
+.B bola
+[\fIcommand\fR] [\fIflags\fR]
+.SH DESCRIPTION
+.B bola
+is a next-generation CLI tool for automated detection of Broken Object
+Level Authorization (BOLA/IDOR) vulnerabilities in web applications.
+.PP
+Unlike replay-only tools such as Autorize and AuthMatrix, bola understands
+resource ownership. It dynamically builds a resource graph from live proxy
+traffic or HAR imports, then systematically tests cross-identity access to
+every discovered resource with intelligent confidence scoring.
+.SH COMMANDS
+.TP
+.B proxy
+Start the MITM proxy and build the resource graph. Configure your browser
+to use the proxy at the configured address (default: 127.0.0.1:8080).
+.TP
+.B scan
+Run cross-identity authorization tests against the built resource graph.
+Compares responses to detect BOLA/IDOR with confidence scoring.
+.TP
+.B import \fIhar-file\fR
+Import a Burp Suite or ZAP Proxy HAR export to build the resource graph
+without live proxy interception.
+.TP
+.B report
+Generate reports from existing scan results in the database.
+.TP
+.B config init
+Generate an example bola.yaml configuration file.
+.TP
+.B version
+Print version information.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIpath\fR
+Path to the configuration file (default: bola.yaml).
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output with detailed logging.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-essential output.
+.TP
+.BR \-h ", " \-\-help
+Show help message.
+.SH WORKFLOW
+A typical bola workflow consists of the following steps:
+.PP
+1. Generate a config:
+.RS
+.B bola config init
+.RE
+2. Edit bola.yaml with target and identity information.
+.PP
+3. Start the proxy and browse the application:
+.RS
+.B bola proxy --config bola.yaml
+.RE
+4. Run the cross-identity scan:
+.RS
+.B bola scan --config bola.yaml
+.RE
+5. Review the generated reports.
+.SH CONFIGURATION
+bola uses a YAML configuration file. Run
+.B bola config init
+to generate an example with full documentation.
+.PP
+Key sections: target (base URL and scope), identities (auth tokens/cookies),
+testing (workers, rate limit), analysis (thresholds), output (formats).
+.SH FILES
+.TP
+.I bola.yaml
+Default configuration file.
+.TP
+.I bola.db
+SQLite database storing the resource graph and findings.
+.TP
+.I bola-report.json
+JSON report output.
+.TP
+.I bola-report.md
+Markdown report output.
+.SH EXAMPLES
+.PP
+Start proxy and capture traffic:
+.RS
+.B bola proxy -c bola.yaml
+.RE
+.PP
+Import from Burp Suite HAR export:
+.RS
+.B bola import traffic.har -c bola.yaml
+.RE
+.PP
+Run scan with verbose output:
+.RS
+.B bola scan -c bola.yaml -v
+.RE
+.PP
+Generate reports from existing database:
+.RS
+.B bola report -c bola.yaml
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Successful execution.
+.TP
+.B 1
+Error during execution.
+.SH AUTHOR
+Mutasem Kharma <mutasem@bola.dev>
+.SH BUGS
+Report bugs at: https://github.com/Mutasem-mk4/bola/issues
+.SH SEE ALSO
+.BR mitmproxy (1),
+.BR burpsuite (1),
+.BR ffuf (1),
+.BR nuclei (1)
+.SH LICENSE
+MIT License. See LICENSE file for details.

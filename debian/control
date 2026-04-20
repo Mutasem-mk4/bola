@@ -1,0 +1,29 @@
+Source: bola
+Section: net
+Priority: optional
+Maintainer: Mutasem Kharma <mutasem@bola.dev>
+Build-Depends: debhelper-compat (= 13),
+               golang-go (>= 2:1.21~)
+Standards-Version: 4.6.2
+Homepage: https://github.com/Mutasem-mk4/bola
+Rules-Requires-Root: no
+
+Package: bola
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: automated BOLA/IDOR vulnerability detection via identity orchestration
+ bola is a next-generation CLI tool for automated detection of Broken
+ Object Level Authorization (BOLA/IDOR) vulnerabilities in modern web
+ applications.
+ .
+ Unlike replay-only tools (Autorize, AuthMatrix), bola dynamically builds
+ a resource ownership graph from live MITM proxy traffic or HAR file
+ imports, then systematically tests cross-identity resource access with
+ intelligent response comparison and confidence scoring.
+ .
+ Features include multi-identity session management with JWT/Cookie/Bearer
+ auto-detection, transparent HTTP/HTTPS proxy, object ID extraction from
+ URLs and JSON bodies, smart deduplication, and HackerOne-ready report
+ generation.
+ .
+ Compiles to a single static binary with zero runtime dependencies.

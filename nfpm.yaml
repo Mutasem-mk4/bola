@@ -1,0 +1,27 @@
+name: bola
+arch: ${ARCH}
+platform: linux
+version: v${VERSION}
+section: net
+priority: optional
+maintainer: Mutasem Kharma <mutasem@bola.dev>
+description: Automated BOLA/IDOR detection via identity orchestration
+vendor: Mutasem Kharma
+homepage: https://github.com/Mutasem-mk4/bola
+license: MIT
+
+contents:
+  - src: bin/bola
+    dst: /usr/bin/bola
+    file_info:
+      mode: 0755
+
+  - src: man/bola.1.gz
+    dst: /usr/share/man/man1/bola.1.gz
+    file_info:
+      mode: 0644
+
+  - src: LICENSE
+    dst: /usr/share/doc/bola/copyright
+    file_info:
+      mode: 0644

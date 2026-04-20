@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: MIT
+# GitHub Actions CI for bola
+
+name: Build & Test
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # Job 1: Lint
+  # ─────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check SPDX headers
+        run: |
+          MISSING=$(grep -rL "SPDX-License-Identifier" \
+            --include="*.go" . \
+            | grep -v vendor/ || true)
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: Missing SPDX headers:"; echo "$MISSING"; exit 1
+          fi
+          echo "✓ All source files have SPDX headers"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db8 # v6
+        with:
+          version: v1.64.2
+          args: --timeout=5m
+
+  # ─────────────────────────────────────────────────────────
+  # Job 2: Test
+  # ─────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run tests with race detector
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+
+  # ─────────────────────────────────────────────────────────
+  # Job 3: Build — multi-arch static binaries
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build (Linux ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build static binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          echo "Building bola v${VERSION} for linux/${{ matrix.arch }}"
+          make build VERSION=${VERSION} GOARCH=${{ matrix.arch }}
+
+      - name: Verify binary
+        run: |
+          ls -la bin/bola
+          file bin/bola
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            bin/bola version
+            bin/bola --help
+          fi
+
+      - name: Verify man page exists
+        run: |
+          test -s man/bola.1 || { echo "ERROR: man/bola.1 is missing or empty"; exit 1; }
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v7
+        with:
+          name: bola-linux-${{ matrix.arch }}
+          path: bin/bola
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────
+  # Job 4: Release
+  # ─────────────────────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install nFPM
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Download amd64 build
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v8
+        with:
+          name: bola-linux-amd64
+          path: bin-amd64/
+
+      - name: Download arm64 build
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v8
+        with:
+          name: bola-linux-arm64
+          path: bin-arm64/
+
+      - name: Generate Multi-Arch Packages
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          gzip -k man/bola.1
+          mkdir -p release-dist
+
+          for arch in amd64 arm64; do
+            echo "--- Packaging for $arch ---"
+            mkdir -p bin
+            cp bin-$arch/bola bin/bola
+            chmod +x bin/bola
+
+            # Compressed tarball
+            tar czf release-dist/bola-v${VERSION}-linux-${arch}.tar.gz \
+              bin/bola man/bola.1.gz LICENSE README.md
+
+            # .deb and .rpm via nfpm
+            VERSION=${VERSION} ARCH=${arch} nfpm pkg --packager deb --target release-dist/
+            VERSION=${VERSION} ARCH=${arch} nfpm pkg --packager rpm --target release-dist/
+
+            rm -rf bin
+          done
+
+          # Checksums
+          cd release-dist
+          sha256sum * > SHA256SUMS.txt
+        shell: bash
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@01570a1f39cb168c169c802c3bceb9e93fb10974 # v3
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-dist/*

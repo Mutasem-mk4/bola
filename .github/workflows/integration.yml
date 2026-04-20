@@ -1,0 +1,222 @@
+# SPDX-License-Identifier: MIT
+# Integration test against OWASP crAPI
+
+name: Integration Test (crAPI)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  integration:
+    name: crAPI BOLA Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build bola
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o bin/bola ./cmd/bola
+          chmod +x bin/bola
+          bin/bola version
+
+      - name: Start crAPI
+        run: |
+          git clone --depth 1 https://github.com/OWASP/crAPI.git /tmp/crAPI
+          cd /tmp/crAPI/deploy/docker
+          docker compose pull
+          docker compose -f docker-compose.yml up -d
+          echo "Waiting for crAPI to be ready..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8888/api/auth/signup > /dev/null 2>&1 || \
+               curl -sf http://localhost:8888 > /dev/null 2>&1; then
+              echo "crAPI is ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Seed test data and generate HAR
+        run: |
+          # Register User A
+          USER_A_RESP=$(curl -sf -X POST http://localhost:8888/identity/api/auth/signup \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"User A","email":"usera@test.com","number":"1234567890","password":"Test@1234"}' || echo '{}')
+          echo "User A signup: ${USER_A_RESP}"
+
+          # Login User A
+          TOKEN_A=$(curl -sf -X POST http://localhost:8888/identity/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"usera@test.com","password":"Test@1234"}' | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+          echo "Token A: ${TOKEN_A:0:20}..."
+
+          # Register User B
+          USER_B_RESP=$(curl -sf -X POST http://localhost:8888/identity/api/auth/signup \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"User B","email":"userb@test.com","number":"0987654321","password":"Test@1234"}' || echo '{}')
+          echo "User B signup: ${USER_B_RESP}"
+
+          # Login User B
+          TOKEN_B=$(curl -sf -X POST http://localhost:8888/identity/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"userb@test.com","password":"Test@1234"}' | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+          echo "Token B: ${TOKEN_B:0:20}..."
+
+          # Save tokens for bola config
+          echo "TOKEN_A=${TOKEN_A}" >> $GITHUB_ENV
+          echo "TOKEN_B=${TOKEN_B}" >> $GITHUB_ENV
+
+          # Browse as User A to discover resources
+          echo "Browsing as User A..."
+          curl -sf -H "Authorization: Bearer ${TOKEN_A}" http://localhost:8888/identity/api/v2/user/dashboard || true
+          curl -sf -H "Authorization: Bearer ${TOKEN_A}" http://localhost:8888/identity/api/v2/user/videos || true
+          curl -sf -H "Authorization: Bearer ${TOKEN_A}" http://localhost:8888/community/api/v2/community/posts/recent || true
+          curl -sf -H "Authorization: Bearer ${TOKEN_A}" http://localhost:8888/community/api/v2/coupon/validate-coupon || true
+
+          # Generate a simple HAR file from the captured requests
+          python3 - <<'PYEOF'
+          import json, os
+          token_a = os.environ.get("TOKEN_A", "")
+          token_b = os.environ.get("TOKEN_B", "")
+
+          endpoints = [
+              {"method": "GET", "url": "http://localhost:8888/identity/api/v2/user/dashboard"},
+              {"method": "GET", "url": "http://localhost:8888/identity/api/v2/user/videos"},
+              {"method": "GET", "url": "http://localhost:8888/community/api/v2/community/posts/recent"},
+          ]
+
+          entries = []
+          for ep in endpoints:
+              entries.append({
+                  "request": {
+                      "method": ep["method"],
+                      "url": ep["url"],
+                      "headers": [
+                          {"name": "Authorization", "value": f"Bearer {token_a}"},
+                          {"name": "Content-Type", "value": "application/json"}
+                      ],
+                      "queryString": [],
+                      "cookies": []
+                  },
+                  "response": {
+                      "status": 200,
+                      "headers": [{"name": "Content-Type", "value": "application/json"}],
+                      "content": {"size": 0, "mimeType": "application/json", "text": "{}"}
+                  }
+              })
+
+          har = {"log": {"version": "1.2", "entries": entries}}
+          with open("testdata/crapi_capture.har", "w") as f:
+              json.dump(har, f, indent=2)
+          print(f"Generated HAR with {len(entries)} entries")
+          PYEOF
+
+      - name: Generate bola config
+        run: |
+          cat > bola.yaml <<EOF
+          target:
+            base_url: "http://localhost:8888"
+            scope:
+              include:
+                - "/identity/*"
+                - "/community/*"
+                - "/workshop/*"
+
+          proxy:
+            listen: "127.0.0.1:8080"
+
+          identities:
+            - name: "userA"
+              role: "user"
+              headers:
+                Authorization: "Bearer ${TOKEN_A}"
+
+            - name: "userB"
+              role: "user"
+              headers:
+                Authorization: "Bearer ${TOKEN_B}"
+
+            - name: "guest"
+              role: "guest"
+
+          testing:
+            workers: 3
+            rate_limit: 5
+            timeout: 10s
+            retry: 1
+
+          analysis:
+            similarity_threshold: 0.70
+            min_confidence: "LOW"
+
+          output:
+            terminal: true
+            json: "bola-report.json"
+            markdown: "bola-report.md"
+            database: "bola.db"
+          EOF
+          echo "Config generated"
+
+      - name: Run bola import
+        run: |
+          bin/bola import testdata/crapi_capture.har -c bola.yaml || true
+
+      - name: Run bola scan
+        run: |
+          timeout 120 bin/bola scan -c bola.yaml || true
+
+      - name: Verify outputs
+        run: |
+          echo "=== Database Stats ==="
+          if [ -f bola.db ]; then
+            echo "Database exists ($(stat -c%s bola.db) bytes)"
+          fi
+
+          echo "=== JSON Report ==="
+          if [ -f bola-report.json ]; then
+            cat bola-report.json | python3 -m json.tool | head -30
+          else
+            echo "No JSON report generated"
+          fi
+
+          echo "=== Markdown Report ==="
+          if [ -f bola-report.md ]; then
+            head -40 bola-report.md
+          else
+            echo "No Markdown report generated"
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v7
+        with:
+          name: crapi-test-reports
+          path: |
+            bola-report.json
+            bola-report.md
+            bola.db
+          retention-days: 14
+
+      - name: Cleanup crAPI
+        if: always()
+        run: |
+          cd /tmp/crAPI/deploy/docker
+          docker compose down -v || true

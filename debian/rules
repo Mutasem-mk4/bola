@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+export DH_GOPKG := github.com/Mutasem-mk4/bola
+export CGO_ENABLED := 0
+export GOPATH := $(CURDIR)/obj-$(DEB_BUILD_GNU_TYPE)/go
+export PATH := $(GOPATH)/bin:$(PATH)
+
+%:
+	dh $@ --buildsystem=golang --builddirectory=obj-$(DEB_BUILD_GNU_TYPE)
+
+override_dh_auto_build:
+	make build-only VERSION=$(DEB_VERSION_UPSTREAM)
+
+override_dh_auto_install:
+	install -D -m 0755 bin/bola $(CURDIR)/debian/bola/usr/bin/bola
+	install -D -m 0644 man/bola.1 $(CURDIR)/debian/bola/usr/share/man/man1/bola.1
+
+override_dh_auto_test:
+	go test -v ./...
