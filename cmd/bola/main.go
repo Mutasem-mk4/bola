@@ -26,9 +26,9 @@ func main() {
 }
 
 var (
-	cfgFile       string
-	verbose       bool
-	quiet         bool
+	cfgFile string
+	verbose bool
+	quiet   bool
 )
 
 var rootCmd = &cobra.Command{
@@ -42,11 +42,12 @@ ownership. It dynamically builds a resource graph from live proxy traffic or
 HAR imports, then systematically tests cross-identity access to every
 discovered resource.
 
-Workflow:
-  1. Configure identities:  bola config init
-  2. Capture traffic:       bola proxy --config bola.yaml
-  3. Run tests:             bola scan --config bola.yaml
-  4. Generate reports:      bola report --config bola.yaml
+Quick Start (3 minutes):
+  1. Generate config:   bola config init
+  2. Edit bola.yaml:    add your target URL and session tokens
+  3. Capture traffic:   bola proxy
+  4. Run tests:         bola scan
+  5. View reports:      bola report
 
 Developed by Mutasem — Cybersecurity & Software Engineer
 https://github.com/Mutasem-mk4`,
@@ -70,6 +71,8 @@ var configCmd = &cobra.Command{
 var configInitCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Generate an example bola.yaml configuration file",
+	Long: `Generate a fully-commented bola.yaml with sensible defaults.
+Edit the file to add your target URL and session tokens, then run bola proxy.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runConfigInit()
 	},
@@ -77,7 +80,6 @@ var configInitCmd = &cobra.Command{
 
 // Proxy flags
 var proxyListen string
-var proxyIdentity string
 
 var proxyCmd = &cobra.Command{
 	Use:   "proxy",
@@ -86,7 +88,7 @@ var proxyCmd = &cobra.Command{
 While browsing the target application, bola silently maps every endpoint,
 extracts object IDs from responses, and builds an ownership resource graph.
 
-The MITM CA certificate is auto-generated on first run to ~/.bola/ca.pem.
+The MITM CA certificate is auto-generated on first run.
 Install it in your browser to inspect HTTPS traffic.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runProxy()
@@ -99,7 +101,9 @@ var importCmd = &cobra.Command{
 	Use:   "import",
 	Short: "Import a HAR file to build the resource graph",
 	Long: `Parse a Burp Suite or ZAP Proxy HAR export to build the resource
-graph without live proxy interception.`,
+graph without live proxy interception.
+
+Usage: bola import --har traffic.har`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runImport()
 	},
@@ -139,7 +143,6 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress non-essential output")
 
 	proxyCmd.Flags().StringVar(&proxyListen, "listen", "", "override proxy listen address")
-	proxyCmd.Flags().StringVar(&proxyIdentity, "identity", "", "filter to specific identity")
 
 	importCmd.Flags().StringVar(&importHARFile, "har", "", "HAR file to import")
 	_ = importCmd.MarkFlagRequired("har")

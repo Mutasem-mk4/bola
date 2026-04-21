@@ -91,14 +91,13 @@ func PrintFindings(findings []*graph.Finding) {
 
 func printFinding(index int, f *graph.Finding) {
 	confStyle := lowStyle
-	confIcon := "🔵"
-	switch f.ConfidenceLevel {
-	case graph.ConfidenceHigh:
+	confColor := lipgloss.Color("#45B7D1")
+	if f.ConfidenceLevel == graph.ConfidenceHigh {
 		confStyle = highStyle
-		confIcon = "🔴"
-	case graph.ConfidenceMedium:
+		confColor = lipgloss.Color("#FF4757")
+	} else if f.ConfidenceLevel == graph.ConfidenceMedium {
 		confStyle = mediumStyle
-		confIcon = "🟡"
+		confColor = lipgloss.Color("#FFA502")
 	}
 
 	method, path := "", ""
@@ -107,23 +106,39 @@ func printFinding(index int, f *graph.Finding) {
 		path = f.Endpoint.Path
 	}
 
-	fmt.Printf("  %s %s %s\n", confIcon,
-		confStyle.Render(fmt.Sprintf("[%s]", f.ConfidenceLevel)),
-		valueStyle.Render(fmt.Sprintf("#%d", index)))
-	fmt.Printf("  %s %s %s\n", labelStyle.Render("Endpoint:"), valueStyle.Render(method), valueStyle.Render(path))
-	fmt.Printf("  %s %s → %s\n", labelStyle.Render("Identity:"), valueStyle.Render(f.OwnerIdentity), confStyle.Render(f.TesterIdentity))
-	fmt.Printf("  %s %s → %s\n", labelStyle.Render("Status:"), valueStyle.Render(fmt.Sprintf("%d", f.OwnerStatus)), confStyle.Render(fmt.Sprintf("%d", f.TesterStatus)))
-	fmt.Printf("  %s %.1f%%     %s %.1f%%\n", labelStyle.Render("Similarity:"), f.Similarity*100, labelStyle.Render("Size Δ:"), f.SizeDelta*100)
+	// Card Header
+	headerLeft := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(confColor).Padding(0, 1).Render(string(f.ConfidenceLevel))
+	headerRight := labelStyle.Render(fmt.Sprintf("Finding #%d", index))
+	
+	header := lipgloss.JoinHorizontal(lipgloss.Top, headerLeft, "  ", headerRight, "\n")
+	
+	// Details Grid
+	details := fmt.Sprintf("%s %s %s\n%s %s → %s\n%s %s → %s\n%s %.1f%%     %s %.1f%%",
+		labelStyle.Render("Endpoint: "), valueStyle.Render(method), valueStyle.Render(path),
+		labelStyle.Render("Identity: "), valueStyle.Render(f.OwnerIdentity), confStyle.Render(f.TesterIdentity),
+		labelStyle.Render("Status:   "), valueStyle.Render(fmt.Sprintf("%d", f.OwnerStatus)), confStyle.Render(fmt.Sprintf("%d", f.TesterStatus)),
+		labelStyle.Render("Sim Score:"), f.Similarity*100, labelStyle.Render("Size Δ:"), f.SizeDelta*100,
+	)
 
+	// Notes & Reproduction
+	extra := ""
 	if f.Notes != "" {
-		fmt.Printf("  %s %s\n", labelStyle.Render("Notes:"), valueStyle.Render(f.Notes))
+		extra += "\n\n" + labelStyle.Render("Notes:") + "\n" + valueStyle.Render(f.Notes)
 	}
+	
+	extra += "\n\n" + labelStyle.Render("Reproduce:") + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#A4B0BE")).Render(fmt.Sprintf("  $ %s", f.CurlCommand))
 
-	fmt.Printf("  %s\n", labelStyle.Render("Reproduce:"))
-	fmt.Printf("    %s\n", valueStyle.Render(f.CurlCommand))
-	fmt.Println()
-	fmt.Println(dividerStyle.Render("  " + strings.Repeat("─", 72)))
-	fmt.Println()
+	// Assemble Card
+	cardContent := lipgloss.JoinVertical(lipgloss.Left, header, details, extra)
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(confColor).
+		Padding(1, 2).
+		MarginBottom(1).
+		Width(70).
+		Render(cardContent)
+
+	fmt.Println(card)
 }
 
 func countByConfidence(findings []*graph.Finding) (high, medium, low int) {

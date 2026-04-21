@@ -197,6 +197,18 @@ func validate(cfg *Config) error {
 	return nil
 }
 
+// DefaultConfig returns a Config object with all defaults populated.
+func DefaultConfig() *Config {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	return cfg
+}
+
+// YAML returns the configuration as a YAML-encoded byte slice.
+func (c *Config) YAML() ([]byte, error) {
+	return yaml.Marshal(c)
+}
+
 // expandPath expands ~ to the user's home directory.
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {

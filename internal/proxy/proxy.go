@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 
@@ -22,6 +24,25 @@ import (
 	"github.com/Mutasem-mk4/bola/internal/vault"
 )
 
+// DiscoveryType defines the type of resource discovered.
+type DiscoveryType string
+
+const (
+	DiscoveryEndpoint DiscoveryType = "ENDPOINT"
+	DiscoveryResource DiscoveryType = "RESOURCE"
+	DiscoveryIdentity DiscoveryType = "IDENTITY"
+)
+
+// DiscoveryEvent represents a new finding by the proxy.
+type DiscoveryEvent struct {
+	Type     DiscoveryType
+	Method   string
+	Path     string
+	Identity string
+	Value    string // ID value for resources
+	Status   int    // Status code for endpoints
+}
+
 // Proxy is a MITM HTTP/HTTPS proxy for traffic capture and resource graph building.
 type Proxy struct {
 	cfg    *config.Config
@@ -30,21 +51,33 @@ type Proxy struct {
 	server *http.Server
 	proxy  *goproxy.ProxyHttpServer
 
+	Events chan DiscoveryEvent
+
 	requestCount atomic.Int64
 	idCount      atomic.Int64
 }
 
 // New creates a new MITM proxy engine.
 func New(cfg *config.Config, db *graph.DB, v *vault.Vault) (*Proxy, error) {
+	// Auto-write the default goproxy certificate to disk for the user
+	caCertPath := cfg.Proxy.TLS.CACert
+	if _, err := os.Stat(caCertPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(caCertPath), 0755); err == nil {
+			_ = os.WriteFile(caCertPath, []byte(goproxy.CA_CERT), 0644)
+			_ = os.WriteFile(cfg.Proxy.TLS.CAKey, []byte(goproxy.CA_KEY), 0600)
+		}
+	}
+
 	gp := goproxy.NewProxyHttpServer()
 	gp.Verbose = false
 	gp.Logger = log.New(io.Discard, "", 0)
 
 	p := &Proxy{
-		cfg:   cfg,
-		db:    db,
-		vault: v,
-		proxy: gp,
+		cfg:    cfg,
+		db:     db,
+		vault:  v,
+		proxy:  gp,
+		Events: make(chan DiscoveryEvent, 100),
 	}
 
 	// Set up response handler
@@ -109,6 +142,14 @@ func (p *Proxy) onResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Res
 		return resp
 	}
 
+	p.emit(DiscoveryEvent{
+		Type:     DiscoveryEndpoint,
+		Method:   req.Method,
+		Path:     normalizedPath,
+		Identity: identity,
+		Status:   resp.StatusCode,
+	})
+
 	// Read request body
 	var reqBody []byte
 	if req.Body != nil {
@@ -145,6 +186,15 @@ func (p *Proxy) onResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Res
 		if err != nil {
 			continue
 		}
+
+		p.emit(DiscoveryEvent{
+			Type:     DiscoveryResource,
+			Method:   req.Method,
+			Path:     normalizedPath,
+			Identity: identity,
+			Value:    oid.Value,
+		})
+
 		for _, parentID := range prevResourceIDs {
 			_ = p.db.InsertRelationship(parentID, resourceID)
 		}
@@ -156,15 +206,16 @@ func (p *Proxy) onResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Res
 
 	p.requestCount.Add(1)
 
-	slog.Info("proxy: captured",
-		"method", req.Method,
-		"path", parsedURL.Path,
-		"identity", identity,
-		"status", resp.StatusCode,
-		"ids", len(ids),
-	)
-
 	return resp
+}
+
+// emit sends an event to the events channel without blocking.
+func (p *Proxy) emit(ev DiscoveryEvent) {
+	select {
+	case p.Events <- ev:
+	default:
+		// Drop event if channel is full to prevent proxy slowdown
+	}
 }
 
 // headerMapFromHTTP converts http.Header to map[string]string.
