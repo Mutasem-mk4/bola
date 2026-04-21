@@ -92,6 +92,7 @@ jobs:
           curl -sf -H "Authorization: Bearer ${TOKEN_A}" http://localhost:8888/community/api/v2/coupon/validate-coupon || true
 
           # Generate a simple HAR file from the captured requests
+          mkdir -p testdata
           python3 - <<'PYEOF'
           import json, os
           token_a = os.environ.get("TOKEN_A", "")

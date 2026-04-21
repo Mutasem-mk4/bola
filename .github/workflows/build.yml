@@ -100,7 +100,7 @@ jobs:
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
           echo "Building bola v${VERSION} for linux/${{ matrix.arch }}"
-          make build VERSION=${VERSION} GOARCH=${{ matrix.arch }}
+          make build-only VERSION=${VERSION} GOARCH=${{ matrix.arch }}
 
       - name: Verify binary
         run: |
