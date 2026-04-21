@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/charmbracelet/bubbletea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Mutasem-mk4/bola/internal/proxy"
