@@ -30,11 +30,11 @@ import (
 
 // Tester orchestrates cross-identity authorization tests.
 type Tester struct {
-	cfg      *config.Config
-	db       *graph.DB
-	vault    *vault.Vault
-	client   *http.Client
-	limiter  *rate.Limiter
+	cfg     *config.Config
+	db      *graph.DB
+	vault   *vault.Vault
+	client  *http.Client
+	limiter *rate.Limiter
 
 	// Stats
 	testsRun      atomic.Int64

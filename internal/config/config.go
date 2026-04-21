@@ -78,9 +78,9 @@ type TestingConfig struct {
 
 // AnalysisConfig defines response analysis parameters.
 type AnalysisConfig struct {
-	SimilarityThreshold  float64  `yaml:"similarity_threshold"`
-	MinConfidence        string   `yaml:"min_confidence"`
-	DetectErrorPatterns  []string `yaml:"detect_error_patterns"`
+	SimilarityThreshold float64  `yaml:"similarity_threshold"`
+	MinConfidence       string   `yaml:"min_confidence"`
+	DetectErrorPatterns []string `yaml:"detect_error_patterns"`
 }
 
 // OutputConfig defines report output settings.

@@ -23,8 +23,8 @@ type ProxyModel struct {
 	TargetURL     string
 	ProxyAddr     string
 	StartTime     time.Time
-	
-	proxyChan    chan proxy.DiscoveryEvent
+
+	proxyChan     chan proxy.DiscoveryEvent
 	width, height int
 }
 
@@ -35,7 +35,7 @@ func NewProxyModel(target, addr string, identities int, ch chan proxy.DiscoveryE
 		ProxyAddr:     addr,
 		IdentityCount: identities,
 		StartTime:     time.Now(),
-		proxyChan:    ch,
+		proxyChan:     ch,
 		Events:        make([]proxy.DiscoveryEvent, 0),
 	}
 }
@@ -69,13 +69,13 @@ func (m *ProxyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if msg.Type == proxy.DiscoveryResource {
 			m.ResourceCount++
 		}
-		
+
 		// Keep last 15 events
 		m.Events = append([]proxy.DiscoveryEvent{msg}, m.Events...)
 		if len(m.Events) > 15 {
 			m.Events = m.Events[:15]
 		}
-		
+
 		return m, waitForEvent(m.proxyChan)
 	}
 
@@ -102,8 +102,8 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF"))
 
-	endpointStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
-	resourceStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
+	endpointStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
+	resourceStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
 	status2xxStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
 	status4xxStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
 )
@@ -115,7 +115,7 @@ func (m *ProxyModel) View() string {
 
 	// Header
 	header := headerStyle.Render("BOLA SENTINEL — LIVE DISCOVERY RADAR")
-	info := fmt.Sprintf(" Target: %s  |  Proxy: %s  |  Uptime: %s", 
+	info := fmt.Sprintf(" Target: %s  |  Proxy: %s  |  Uptime: %s",
 		m.TargetURL, m.ProxyAddr, time.Since(m.StartTime).Round(time.Second))
 
 	// Stats
@@ -135,7 +135,7 @@ func (m *ProxyModel) View() string {
 			if ev.Status >= 400 {
 				statusStyle = status4xxStyle
 			}
-			line = fmt.Sprintf(" [%s] %s %-40s %s", 
+			line = fmt.Sprintf(" [%s] %s %-40s %s",
 				statusStyle.Render(fmt.Sprint(ev.Status)),
 				ev.Method,
 				endpointStyle.Render(ev.Path),

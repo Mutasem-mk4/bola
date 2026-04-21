@@ -122,12 +122,12 @@ func TestRequestsCRUD(t *testing.T) {
 
 	epID, _ := db.InsertEndpoint("GET", "/api/users/{id}", "/api/users/1")
 	_, err := db.InsertRequest(&CapturedRequest{
-		EndpointID: epID,
-		Identity:   "user1",
-		Method:     "GET",
-		URL:        "http://localhost/api/users/1",
-		Headers:    `{"Authorization":"Bearer x"}`,
-		StatusCode: 200,
+		EndpointID:   epID,
+		Identity:     "user1",
+		Method:       "GET",
+		URL:          "http://localhost/api/users/1",
+		Headers:      `{"Authorization":"Bearer x"}`,
+		StatusCode:   200,
 		ResponseBody: []byte(`{"id": 1}`),
 		ResponseSize: 10,
 	})

@@ -4,7 +4,7 @@
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GO_VERSION  := $(shell go version | awk '{print $$3}')
 BINARY      := bola
-DIST        := dist
+DIST        := bin
 MODULE      := github.com/Mutasem-mk4/bola
 LDFLAGS     := -s -w -X main.version=$(VERSION) -X main.buildGoVersion=$(GO_VERSION)
 BUILD_FLAGS := -trimpath -ldflags="$(LDFLAGS)"

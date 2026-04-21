@@ -72,7 +72,7 @@ func runConfigInit() error {
 	if _, err := os.Stat(filename); err == nil {
 		fmt.Printf("[!] %s already exists. Overwrite? (y/n) ", filename)
 		var confirm string
-		fmt.Scanln(&confirm)
+		_, _ = fmt.Scanln(&confirm)
 		if strings.ToLower(confirm) != "y" {
 			fmt.Println("[*] Cancelled. Your existing config is unchanged.")
 			return nil

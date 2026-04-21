@@ -109,9 +109,9 @@ func printFinding(index int, f *graph.Finding) {
 	// Card Header
 	headerLeft := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(confColor).Padding(0, 1).Render(string(f.ConfidenceLevel))
 	headerRight := labelStyle.Render(fmt.Sprintf("Finding #%d", index))
-	
+
 	header := lipgloss.JoinHorizontal(lipgloss.Top, headerLeft, "  ", headerRight, "\n")
-	
+
 	// Details Grid
 	details := fmt.Sprintf("%s %s %s\n%s %s → %s\n%s %s → %s\n%s %.1f%%     %s %.1f%%",
 		labelStyle.Render("Endpoint: "), valueStyle.Render(method), valueStyle.Render(path),
@@ -125,7 +125,7 @@ func printFinding(index int, f *graph.Finding) {
 	if f.Notes != "" {
 		extra += "\n\n" + labelStyle.Render("Notes:") + "\n" + valueStyle.Render(f.Notes)
 	}
-	
+
 	extra += "\n\n" + labelStyle.Render("Reproduce:") + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#A4B0BE")).Render(fmt.Sprintf("  $ %s", f.CurlCommand))
 
 	// Assemble Card

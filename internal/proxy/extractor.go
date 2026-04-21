@@ -32,10 +32,7 @@ type ObjectID struct {
 
 // Package-level compiled regex patterns for performance.
 var (
-	// Strict UUIDv4: 8-4-4-4-12 hex with version 4 indicator and variant bits
-	uuidV4Pattern = regexp.MustCompile(
-		`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`,
-	)
+
 	// Generic UUID: any version
 	uuidGenericPattern = regexp.MustCompile(
 		`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,

@@ -24,7 +24,7 @@ func main() {
 	// Make sure proxy is killed when script exits
 	defer func() {
 		fmt.Println("[*] Stopping Proxy Engine...")
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 	}()
 
 	time.Sleep(3 * time.Second)
@@ -44,14 +44,14 @@ func main() {
 	doRequest(client, "Owner", "https://api.dashboard.magic.link/v1/magic_client/r85h34hQg16SegSbk_3I5zh4r7ZIvfl9hwSU5KvMToE=/users", ownerCookie)
 	doRequest(client, "Attacker", "https://api.dashboard.magic.link/v1/magic_client/attacker_client_id/users", attackerCookie)
 
-	cmd.Process.Kill()
+	_ = cmd.Process.Kill()
 	time.Sleep(1 * time.Second)
 
 	fmt.Println("[*] Running BOLA Scanner...")
 	scanCmd := exec.Command("C:\\Users\\User\\go\\bin\\bola.exe", "scan", "-c", "bola.yaml")
 	scanCmd.Stdout = os.Stdout
 	scanCmd.Stderr = os.Stderr
-	scanCmd.Run()
+	_ = scanCmd.Run()
 }
 
 func doRequest(c *http.Client, role, uri, cookie string) {
@@ -64,6 +64,6 @@ func doRequest(c *http.Client, role, uri, cookie string) {
 		return
 	}
 	defer resp.Body.Close()
-	io.ReadAll(resp.Body)
+	_, _ = io.ReadAll(resp.Body)
 	fmt.Printf(" [Success] %d\n", resp.StatusCode)
 }

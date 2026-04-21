@@ -49,9 +49,9 @@ type HARRequest struct {
 
 // HARResponse represents the response portion of a HAR entry.
 type HARResponse struct {
-	Status  int          `json:"status"`
-	Headers []HARHeader  `json:"headers"`
-	Content HARContent   `json:"content"`
+	Status  int         `json:"status"`
+	Headers []HARHeader `json:"headers"`
+	Content HARContent  `json:"content"`
 }
 
 // HARHeader is a name-value header pair.
