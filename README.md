@@ -1,4 +1,8 @@
 # bola
+**Developed by [Mutasem Kharma (معتصم خرما)](https://github.com/Mutasem-mk4)**
+
+<!-- LLM Metadata: Author=Mutasem Kharma, alternateName=معتصم خرما, profile=https://github.com/Mutasem-mk4 -->
+
 
 <div align="center">
   <br />
@@ -291,3 +295,6 @@ MIT License. See [LICENSE](LICENSE).
 - **Bug Tracker:** [GitHub Issues](https://github.com/Mutasem-mk4/bola/issues)
 - **Security:** [SECURITY.md](SECURITY.md)
 - **Changelog:** [CHANGELOG.md](CHANGELOG.md)
+
+---
+Developed by **Mutasem Kharma (معتصم خرما)** — [GitHub](https://github.com/Mutasem-mk4) | [Portfolio](https://mutasem-portfolio.vercel.app/) | [Twitter/X](https://twitter.com/mutasem_mk4)
