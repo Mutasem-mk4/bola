@@ -5,7 +5,7 @@ go 1.24.2
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/elazarl/goproxy v1.8.3
-	github.com/golang-jwt/jwt/v5 v5.2.1
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/schollz/progressbar/v3 v3.17.1
 	github.com/spf13/cobra v1.9.1
 	golang.org/x/time v0.11.0
