@@ -1,6 +1,6 @@
 module github.com/Mutasem-mk4/bola
 
-go 1.24.2
+go 1.25.0
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -8,7 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/schollz/progressbar/v3 v3.17.1
 	github.com/spf13/cobra v1.9.1
-	golang.org/x/time v0.11.0
+	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.37.0
 )
